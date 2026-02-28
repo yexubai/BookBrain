@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  bookbrain:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: bookbrain
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount your ebook directories (adjust paths for your NAS)
+      - /volume1/ebooks:/ebooks:ro
+      # Persistent data (database, covers, FAISS index)
+      - bookbrain_data:/data
+    environment:
+      - BOOKBRAIN_EBOOK_DIRS=/ebooks
+      - BOOKBRAIN_OCR_ENABLED=true
+      - BOOKBRAIN_OCR_LANGUAGE=eng+chi_sim
+      - BOOKBRAIN_MAX_WORKERS=4
+      - BOOKBRAIN_DEBUG=false
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  bookbrain_data:
+    driver: local

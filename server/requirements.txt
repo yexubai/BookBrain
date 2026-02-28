@@ -1,0 +1,30 @@
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# Database
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+
+# PDF Processing
+PyMuPDF==1.25.3
+
+# EPUB Processing
+ebooklib==0.18
+
+# OCR
+pytesseract==0.3.13
+Pillow==11.1.0
+
+# ML & Search
+sentence-transformers==3.4.1
+faiss-cpu==1.9.0.post1
+
+# Data Validation
+pydantic==2.10.5
+pydantic-settings==2.7.1
+
+# Testing
+pytest==8.3.4
+httpx==0.28.1
