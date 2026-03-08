@@ -1,6 +1,9 @@
 """REST API routes for BookBrain."""
 
 import math
+import asyncio
+import logging
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +24,7 @@ from api.schemas import (
     StatsResponse,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["api"])
 
 
@@ -119,6 +123,37 @@ async def get_book_cover(
     )
 
 
+@router.get("/books/{book_id}/file")
+async def get_book_file(
+    book_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve the original ebook file for reading."""
+    book = await get_book(session, book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    file_path = Path(book.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    mime_types = {
+        "pdf": "application/pdf",
+        "epub": "application/epub+zip",
+    }
+    media_type = mime_types.get(book.format, "application/octet-stream")
+
+    return FileResponse(
+        str(file_path),
+        media_type=media_type,
+        filename=file_path.name,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
 # ─── Categories ─────────────────────────────────────────────────
 
 @router.get("/categories", response_model=list[CategoryResponse])
@@ -138,20 +173,13 @@ async def search_books(
     session: AsyncSession = Depends(get_session),
 ):
     """Semantic search across books."""
-    # Lazy import to avoid loading ML model until needed
     from search.vector_store import vector_store
 
     results = await vector_store.search(q, top_k=limit)
 
     search_results = []
-    for vector_id, score in results:
-        # Find book by vector_id
-        from sqlalchemy import select
-        from db.models import Book
-        result = await session.execute(
-            select(Book).where(Book.vector_id == vector_id)
-        )
-        book = result.scalar_one_or_none()
+    for book_id, score in results:
+        book = await get_book(session, book_id)
         if book:
             search_results.append(SearchResult(book=book, score=float(score)))
 
@@ -164,27 +192,39 @@ async def search_books(
 
 # ─── Ingest ─────────────────────────────────────────────────────
 
-# Global ingest status
-_ingest_status = IngestStatus()
+# Use a plain dict for mutable progress tracking (NOT a Pydantic model)
+_ingest_state: dict = {
+    "is_running": False,
+    "total_files": 0,
+    "processed_files": 0,
+    "failed_files": 0,
+    "current_file": None,
+    "errors": [],
+    "progress_percent": 0.0,
+}
 
 
-def get_ingest_status() -> IngestStatus:
-    """Get the global ingest status."""
-    return _ingest_status
+def _reset_state():
+    """Reset ingest state."""
+    _ingest_state.update({
+        "is_running": True,
+        "total_files": 0,
+        "processed_files": 0,
+        "failed_files": 0,
+        "current_file": None,
+        "errors": [],
+        "progress_percent": 0.0,
+    })
 
 
 @router.post("/ingest", response_model=IngestStatus)
 async def trigger_ingest(
     request: IngestRequest = None,
-    session: AsyncSession = Depends(get_session),
 ):
     """Trigger ebook directory scan and processing."""
-    global _ingest_status
-
-    if _ingest_status.is_running:
+    if _ingest_state["is_running"]:
         raise HTTPException(status_code=409, detail="Ingest is already running")
 
-    import asyncio
     from ingest.pipeline import IngestPipeline
 
     # Determine directories to scan
@@ -205,27 +245,30 @@ async def trigger_ingest(
         if not d.exists():
             raise HTTPException(status_code=400, detail=f"Directory not found: {d}")
 
+    _reset_state()
     pipeline = IngestPipeline()
-    _ingest_status = IngestStatus(is_running=True)
 
     # Run pipeline in background
     async def run_pipeline():
-        global _ingest_status
         try:
-            await pipeline.run(dirs, _ingest_status)
+            logger.info("Background ingest task started for: %s", dirs)
+            await pipeline.run(dirs, _ingest_state)
+            logger.info("Background ingest task completed")
         except Exception as e:
-            _ingest_status.errors.append(str(e))
+            logger.error("Ingest pipeline crashed: %s\n%s", e, traceback.format_exc())
+            _ingest_state["errors"].append(f"Pipeline error: {e}")
         finally:
-            _ingest_status.is_running = False
+            _ingest_state["is_running"] = False
+            _ingest_state["current_file"] = None
 
     asyncio.create_task(run_pipeline())
-    return _ingest_status
+    return IngestStatus(**_ingest_state)
 
 
 @router.get("/ingest/status", response_model=IngestStatus)
 async def ingest_status():
     """Get current ingest pipeline status."""
-    return _ingest_status
+    return IngestStatus(**_ingest_state)
 
 
 # ─── Settings ───────────────────────────────────────────────────

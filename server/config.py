@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     batch_size: int = 32  # Batch size for embedding
 
     # Supported formats
-    supported_formats: List[str] = [".pdf", ".epub"]
+    supported_formats: List[str] = [".pdf", ".epub", ".mobi", ".azw3", ".txt", ".cbz", ".html"]
 
     model_config = {
         "env_prefix": "BOOKBRAIN_",

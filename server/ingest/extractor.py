@@ -219,6 +219,113 @@ def extract_epub(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     return metadata
 
 
+def extract_txt(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+    """Extract metadata and text from a TXT file."""
+    metadata = BookMetadata.title = file_path.stem
+    metadata = BookMetadata(title=file_path.stem)
+    try:
+        # Try to read with UTF-8, fallback to other encodings
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                content = file_path.read_text(encoding="gbk")
+            except UnicodeDecodeError:
+                content = file_path.read_text(encoding="latin-1", errors="ignore")
+                
+        # Basic heuristic for title/author in first few lines
+        lines = [line.strip() for line in content[:1000].split("\n") if line.strip()]
+        if len(lines) >= 2:
+            if len(lines[0]) < 100:
+                metadata.title = lines[0]
+            if "by" in lines[1].lower() or "author" in lines[1].lower():
+                metadata.author = lines[1].replace("By", "").replace("by", "").replace("Author:", "").strip()
+                
+        metadata.text_content = content[:max_text_length]
+    except Exception as e:
+        logger.error("Failed to extract TXT %s: %s", file_path, e)
+        
+    return metadata
+
+
+def extract_html(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+    """Extract text from HTML file."""
+    metadata = BookMetadata(title=file_path.stem)
+    try:
+        from bs4 import BeautifulSoup
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = file_path.read_text(encoding="gbk", errors="ignore")
+            
+        soup = BeautifulSoup(content, "html.parser")
+        
+        if soup.title:
+            metadata.title = soup.title.string.strip()
+            
+        text = soup.get_text(separator="\n")
+        # Clean up multiple newlines
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        metadata.text_content = "\n".join(lines)[:max_text_length]
+    except Exception as e:
+        logger.error("Failed to extract HTML %s: %s", file_path, e)
+        
+    return metadata
+
+
+def extract_mobi_azw3(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+    """Basic extraction for Kindle formats (MOBI/AZW3).
+    Requires 'mobi' package for full extraction, doing basic fallback for now.
+    """
+    metadata = BookMetadata(title=file_path.stem)
+    try:
+        # We read raw bytes and extract visible ASCII/UTF8 text as a brutal fallback
+        # In a production app, use 'mobi' or 'calibre' CLI tools here
+        raw = file_path.read_bytes()
+        # Very crude ascii string extraction for basic searchability
+        import string
+        printable = set(string.printable.encode())
+        text_bytes = bytearray()
+        for b in raw[:max_text_length * 2]: # search first chunk
+            if b in printable:
+                text_bytes.append(b)
+        
+        import re
+        text = text_bytes.decode('ascii', errors='ignore')
+        # Remove massive whitespace blocks and XML tags
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        metadata.text_content = text[:max_text_length]
+        
+    except Exception as e:
+        logger.error("Failed to extract MOBI/AZW3 %s: %s", file_path, e)
+        
+    return metadata
+
+
+def extract_cbz(file_path: Path) -> BookMetadata:
+    """Extract metadata from CBZ (Comic Book Zip). Text extraction skipped as it's images."""
+    import zipfile
+    metadata = BookMetadata(title=file_path.stem)
+    try:
+        with zipfile.ZipFile(file_path, 'r') as zf:
+            # Count images for page count
+            img_exts = ('.jpg', '.jpeg', '.png', '.webp')
+            images = [f for f in zf.namelist() if f.lower().endswith(img_exts) and not f.startswith('__MACOSX/')]
+            metadata.page_count = len(images)
+            
+            # Try to grab first image as cover
+            if images:
+                images.sort() # Ensure we get the first page
+                cover_filename = images[0]
+                metadata.cover_image = zf.read(cover_filename)
+                metadata.cover_ext = Path(cover_filename).suffix.lower()
+    except Exception as e:
+        logger.error("Failed to extract CBZ %s: %s", file_path, e)
+        
+    return metadata
+
+
 def extract_metadata(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     """Extract metadata and text from an ebook file.
 
@@ -230,6 +337,14 @@ def extract_metadata(file_path: Path, max_text_length: int = 50000) -> BookMetad
         return extract_pdf(file_path, max_text_length)
     elif ext == ".epub":
         return extract_epub(file_path, max_text_length)
+    elif ext == ".txt":
+        return extract_txt(file_path, max_text_length)
+    elif ext in (".htm", ".html"):
+        return extract_html(file_path, max_text_length)
+    elif ext in (".mobi", ".azw3"):
+        return extract_mobi_azw3(file_path, max_text_length)
+    elif ext == ".cbz":
+        return extract_cbz(file_path)
     else:
         logger.warning("Unsupported format: %s", ext)
         return BookMetadata(title=file_path.stem)

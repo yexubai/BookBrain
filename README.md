@@ -9,6 +9,7 @@ Smart ebook management system with OCR, automatic classification, and semantic s
 - **Smart classification** — Rule-based + ML zero-shot classification into 10+ categories
 - **Semantic search** — FAISS vector search powered by sentence-transformers
 - **Modern UI** — Dark theme React frontend with grid/list views, category tree, search
+- **Desktop app** — Tauri 2.x wrapper for native Windows/macOS/Linux desktop experience
 - **NAS deployment** — Docker Compose ready for Synology NAS
 
 ## Architecture
@@ -23,10 +24,9 @@ BookBrain/
 │   ├── classify/           # Rule + ML classifier
 │   ├── search/             # FAISS vector store
 │   └── api/                # REST routes & schemas
-├── client/                 # React + Vite frontend
-│   └── src/
-│       ├── components/     # Sidebar, Topbar, BookDetail
-│       └── pages/          # Library, Search, Ingest, Settings
+├── client/                 # React + Vite frontend + Tauri desktop
+│   ├── src/                # React components & pages
+│   └── src-tauri/          # Tauri Rust shell (desktop app)
 └── docker/                 # Dockerfile & docker-compose.yml
 ```
 
@@ -42,7 +42,7 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Open http://localhost:8000/docs for Swagger UI.
 
-### Frontend
+### Frontend (Web)
 
 ```bash
 cd client
@@ -51,6 +51,16 @@ npm run dev
 ```
 
 Open http://localhost:1420
+
+### Desktop App (Tauri)
+
+Requires [Rust](https://rustup.rs/) installed.
+
+```bash
+cd client
+npm run tauri:dev     # Development with hot-reload
+npm run tauri:build   # Build .exe / .dmg / .deb installer
+```
 
 ### Docker (NAS)
 
@@ -89,5 +99,6 @@ Set via environment variables (prefix `BOOKBRAIN_`) or `.env` file:
 ## Dependencies
 
 - Python 3.10+, Node.js 18+
+- [Rust](https://rustup.rs/) (for Tauri desktop app)
 - [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (for scanned PDFs)
 - sentence-transformers model (~90MB, auto-downloaded)

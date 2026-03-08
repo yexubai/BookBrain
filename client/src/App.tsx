@@ -6,6 +6,7 @@ import LibraryPage from './pages/LibraryPage'
 import SearchPage from './pages/SearchPage'
 import SettingsPage from './pages/SettingsPage'
 import IngestPage from './pages/IngestPage'
+import ReaderPage from './pages/ReaderPage'
 
 export default function App() {
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
@@ -39,6 +40,7 @@ export default function App() {
                         />
                         <Route path="/ingest" element={<IngestPage />} />
                         <Route path="/settings" element={<SettingsPage />} />
+                        <Route path="/reader" element={<ReaderPage />} />
                     </Routes>
                 </div>
             </div>

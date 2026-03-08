@@ -1,5 +1,6 @@
+import { useNavigate } from 'react-router-dom'
 import { api, Book } from '../api'
-import { FiX } from 'react-icons/fi'
+import { FiX, FiBookOpen } from 'react-icons/fi'
 
 interface BookDetailProps {
     book: Book
@@ -13,6 +14,13 @@ function formatSize(bytes: number): string {
 }
 
 export default function BookDetail({ book, onClose }: BookDetailProps) {
+    const navigate = useNavigate()
+
+    const openReader = () => {
+        onClose()
+        navigate(`/reader?id=${book.id}`)
+    }
+
     return (
         <div className="modal-overlay" onClick={onClose}>
             <div className="modal-content" onClick={e => e.stopPropagation()}>
@@ -31,6 +39,10 @@ export default function BookDetail({ book, onClose }: BookDetailProps) {
                                 <span style={{ fontSize: '64px', opacity: 0.3 }}>📖</span>
                             </div>
                         )}
+                        <button className="btn btn-primary read-btn" onClick={openReader}>
+                            <FiBookOpen style={{ marginRight: '6px' }} />
+                            Read
+                        </button>
                     </div>
                     <div className="modal-details">
                         <div className="modal-title">{book.title}</div>

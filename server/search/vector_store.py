@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -13,14 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class VectorStore:
-    """FAISS-based vector store for semantic book search.
-
-    Uses sentence-transformers for encoding text into vectors,
-    then FAISS for fast nearest-neighbor search.
-    """
+    """FAISS-based vector store for semantic book search."""
 
     def __init__(self):
         self._model = None
+        self._model_load_failed = False  # Don't retry if loading failed
         self._index = None
         self._id_map: dict = {}  # vector_idx -> book_id
         self._next_id: int = 0
@@ -29,11 +25,20 @@ class VectorStore:
 
     def _get_model(self):
         """Lazy-load the sentence-transformer model."""
+        if self._model_load_failed:
+            return None
+
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading embedding model: %s", settings.embedding_model)
-            self._model = SentenceTransformer(settings.embedding_model)
-            logger.info("Model loaded successfully")
+            try:
+                from sentence_transformers import SentenceTransformer
+                logger.info("Loading embedding model: %s", settings.embedding_model)
+                self._model = SentenceTransformer(settings.embedding_model)
+                logger.info("Model loaded successfully")
+            except Exception as e:
+                logger.warning("Failed to load embedding model (disabling vector search): %s", e)
+                self._model_load_failed = True
+                return None
+
         return self._model
 
     def _get_index(self):
@@ -44,14 +49,13 @@ class VectorStore:
             if self._index_path.exists():
                 logger.info("Loading existing FAISS index from %s", self._index_path)
                 self._index = faiss.read_index(str(self._index_path))
-                # Load ID map
                 if self._map_path.exists():
                     data = np.load(str(self._map_path), allow_pickle=True).item()
                     self._id_map = data.get("id_map", {})
                     self._next_id = data.get("next_id", 0)
             else:
                 logger.info("Creating new FAISS index (dim=%d)", settings.embedding_dimension)
-                self._index = faiss.IndexFlatIP(settings.embedding_dimension)  # Inner Product (cosine sim for normalized vectors)
+                self._index = faiss.IndexFlatIP(settings.embedding_dimension)
                 self._id_map = {}
                 self._next_id = 0
 
@@ -71,25 +75,25 @@ class VectorStore:
             )
             logger.info("FAISS index saved (%d vectors)", self._index.ntotal)
 
-    def _encode(self, text: str) -> np.ndarray:
+    def _encode(self, text: str) -> Optional[np.ndarray]:
         """Encode text to a normalized embedding vector."""
         model = self._get_model()
+        if model is None:
+            return None
         embedding = model.encode(text, normalize_embeddings=True)
         return embedding.reshape(1, -1).astype("float32")
 
     async def add_text(self, text: str, book_id: int) -> Optional[int]:
-        """Add a text entry to the vector store.
+        """Add a text entry to the vector store."""
+        if self._model_load_failed:
+            return None
 
-        Args:
-            text: Text to encode and index.
-            book_id: Associated book ID.
-
-        Returns:
-            Vector ID, or None on failure.
-        """
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             vector = await loop.run_in_executor(None, self._encode, text)
+
+            if vector is None:
+                return None
 
             index = self._get_index()
             vector_id = self._next_id
@@ -97,7 +101,7 @@ class VectorStore:
             self._id_map[vector_id] = book_id
             self._next_id += 1
 
-            # Save periodically (every 10 additions)
+            # Save periodically
             if self._next_id % 10 == 0:
                 await loop.run_in_executor(None, self._save_index)
 
@@ -110,24 +114,21 @@ class VectorStore:
     async def search(
         self, query: str, top_k: int = 20
     ) -> List[Tuple[int, float]]:
-        """Search for similar documents.
+        """Search for similar documents. Returns list of (book_id, score)."""
+        if self._model_load_failed:
+            return []
 
-        Args:
-            query: Search query text.
-            top_k: Number of results to return.
-
-        Returns:
-            List of (book_id, score) tuples.
-        """
         try:
             index = self._get_index()
             if index.ntotal == 0:
                 return []
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             query_vector = await loop.run_in_executor(None, self._encode, query)
 
-            # Search
+            if query_vector is None:
+                return []
+
             k = min(top_k, index.ntotal)
             scores, indices = index.search(query_vector, k)
 
@@ -147,15 +148,11 @@ class VectorStore:
 
     async def save(self):
         """Force save the index to disk."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._save_index)
 
     async def rebuild(self, texts_and_ids: List[Tuple[str, int]]):
-        """Rebuild the entire index from scratch.
-
-        Args:
-            texts_and_ids: List of (text, book_id) tuples.
-        """
+        """Rebuild the entire index from scratch."""
         import faiss
 
         logger.info("Rebuilding FAISS index with %d entries", len(texts_and_ids))
@@ -165,8 +162,10 @@ class VectorStore:
         self._next_id = 0
 
         model = self._get_model()
+        if model is None:
+            logger.warning("Cannot rebuild index: model not available")
+            return
 
-        # Batch encode
         texts = [t for t, _ in texts_and_ids]
         ids = [i for _, i in texts_and_ids]
 

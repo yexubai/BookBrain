@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from config import settings
 from db.database import async_session
@@ -27,6 +28,17 @@ class IngestPipeline:
         self.scanner = Scanner()
         self.ocr = OCRProcessor()
         self.executor = ThreadPoolExecutor(max_workers=settings.max_workers)
+        self._classifier = None  # Shared classifier instance
+
+    def _get_classifier(self):
+        """Get or create a shared classifier instance."""
+        if self._classifier is None:
+            try:
+                from classify.classifier import Classifier
+                self._classifier = Classifier()
+            except Exception as e:
+                logger.warning("Could not initialize classifier: %s", e)
+        return self._classifier
 
     def _process_single_file(self, file_path: Path) -> dict:
         """Process a single ebook file (runs in thread pool).
@@ -58,26 +70,35 @@ class IngestPipeline:
             # Save cover image
             cover_path = None
             if metadata.cover_image:
-                cover_filename = f"{file_hash}{metadata.cover_ext}"
-                cover_file = settings.covers_dir / cover_filename
-                cover_file.write_bytes(metadata.cover_image)
-                cover_path = str(cover_file)
+                try:
+                    cover_filename = f"{file_hash}{metadata.cover_ext}"
+                    cover_file = settings.covers_dir / cover_filename
+                    cover_file.write_bytes(metadata.cover_image)
+                    cover_path = str(cover_file)
+                except Exception as e:
+                    logger.warning("Failed to save cover for %s: %s", file_path.name, e)
 
-            # Classify the book
+            # Classify the book (use shared classifier, rule-based only to avoid slow ML)
             category = "Uncategorized"
             subcategory = None
             try:
-                from classify.classifier import Classifier
-                classifier = Classifier()
-                cat_result = classifier.classify(
-                    title=metadata.title,
-                    text=metadata.text_content[:5000],
-                    author=metadata.author,
-                )
-                category = cat_result.get("category", "Uncategorized")
-                subcategory = cat_result.get("subcategory")
+                classifier = self._get_classifier()
+                if classifier:
+                    cat_result = classifier.classify(
+                        title=metadata.title,
+                        text=metadata.text_content[:5000],
+                        author=metadata.author,
+                    )
+                    category = cat_result.get("category", "Uncategorized")
+                    subcategory = cat_result.get("subcategory")
             except Exception as e:
-                logger.warning("Classification failed: %s", e)
+                logger.warning("Classification failed for %s: %s", file_path.name, e)
+
+            summary = ""
+            if metadata.text_content:
+                summary = metadata.text_content[:500]
+                if len(metadata.text_content) > 500:
+                    summary += "..."
 
             return {
                 "success": True,
@@ -96,7 +117,7 @@ class IngestPipeline:
                     "cover_path": cover_path,
                     "category": category,
                     "subcategory": subcategory,
-                    "summary": (metadata.text_content[:500] + "...") if len(metadata.text_content) > 500 else metadata.text_content,
+                    "summary": summary,
                     "text_content": metadata.text_content,
                     "page_count": metadata.page_count,
                     "ocr_processed": ocr_processed,
@@ -105,52 +126,63 @@ class IngestPipeline:
             }
 
         except Exception as e:
-            logger.error("Failed to process %s: %s", file_path, e)
+            logger.error("Failed to process %s: %s\n%s", file_path, e, traceback.format_exc())
             return {
                 "success": False,
                 "file_path": str(file_path),
                 "error": str(e),
             }
 
-    async def run(self, directories: List[Path], status=None) -> None:
+    async def run(self, directories: List[Path], status: dict = None) -> None:
         """Run the full ingest pipeline.
 
         Args:
             directories: Directories to scan.
-            status: IngestStatus object to update with progress.
+            status: Mutable dict to update with progress.
         """
         # Step 1: Scan for files
+        logger.info("Scanning directories: %s", directories)
         files = self.scanner.scan(directories)
 
-        if status:
-            status.total_files = len(files)
+        if status is not None:
+            status["total_files"] = len(files)
 
         if not files:
             logger.info("No ebook files found.")
             return
 
         logger.info("Starting processing of %d files", len(files))
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
-        # Step 2: Process files in thread pool
+        # Step 2: Process files one by one
         for idx, file_path in enumerate(files):
-            if status:
-                status.current_file = file_path.name
-                status.progress_percent = (idx / len(files)) * 100
+            if status is not None:
+                status["current_file"] = file_path.name
+                status["progress_percent"] = ((idx) / len(files)) * 100
 
             # Check if already processed
-            async with async_session() as session:
-                existing = await get_book_by_path(session, str(file_path))
-                if existing:
-                    logger.info("Skipping already processed: %s", file_path.name)
-                    if status:
-                        status.processed_files += 1
-                    continue
+            try:
+                async with async_session() as session:
+                    existing = await get_book_by_path(session, str(file_path))
+                    if existing:
+                        logger.info("Skipping already processed: %s", file_path.name)
+                        if status is not None:
+                            status["processed_files"] += 1
+                        continue
+            except Exception as e:
+                logger.error("DB check failed for %s: %s", file_path.name, e)
 
             # Process in thread pool
-            result = await loop.run_in_executor(
-                self.executor, self._process_single_file, file_path
-            )
+            try:
+                result = await loop.run_in_executor(
+                    self.executor, self._process_single_file, file_path
+                )
+            except Exception as e:
+                logger.error("Thread pool error for %s: %s", file_path.name, e)
+                if status is not None:
+                    status["failed_files"] += 1
+                    status["errors"].append(f"{file_path.name}: {e}")
+                continue
 
             if result["success"]:
                 # Save to database
@@ -158,39 +190,42 @@ class IngestPipeline:
                     async with async_session() as session:
                         book = await create_book(session, **result["data"])
                         await session.commit()
+                        logger.info("Saved book: %s (id=%d)", result["data"]["title"], book.id)
 
-                        # Generate embedding for vector search
-                        try:
-                            from search.vector_store import vector_store
-                            text_for_embedding = f"{book.title} {book.author} {book.text_content or ''}"
-                            vector_id = await vector_store.add_text(
-                                text_for_embedding[:2000], book.id
-                            )
-                            if vector_id is not None:
-                                book.vector_id = vector_id
+                    # Generate embedding (separate session, non-blocking)
+                    try:
+                        from search.vector_store import vector_store
+                        text_for_embedding = f"{book.title} {book.author} {book.text_content or ''}"
+                        vector_id = await vector_store.add_text(
+                            text_for_embedding[:2000], book.id
+                        )
+                        if vector_id is not None:
+                            async with async_session() as session:
+                                from db.crud import update_book
+                                await update_book(session, book.id, vector_id=vector_id)
                                 await session.commit()
-                        except Exception as e:
-                            logger.warning("Vector indexing failed for %s: %s", file_path.name, e)
+                    except Exception as e:
+                        logger.warning("Vector indexing skipped for %s: %s", file_path.name, e)
 
-                    if status:
-                        status.processed_files += 1
-                    logger.info("Saved: %s", result["data"]["title"])
+                    if status is not None:
+                        status["processed_files"] += 1
+
                 except Exception as e:
-                    logger.error("Failed to save %s: %s", file_path.name, e)
-                    if status:
-                        status.failed_files += 1
-                        status.errors.append(f"{file_path.name}: {e}")
+                    logger.error("Failed to save %s: %s\n%s", file_path.name, e, traceback.format_exc())
+                    if status is not None:
+                        status["failed_files"] += 1
+                        status["errors"].append(f"{file_path.name}: DB save error: {e}")
             else:
-                if status:
-                    status.failed_files += 1
-                    status.errors.append(f"{result['file_path']}: {result['error']}")
+                if status is not None:
+                    status["failed_files"] += 1
+                    status["errors"].append(f"{result['file_path']}: {result['error']}")
 
-        if status:
-            status.progress_percent = 100.0
-            status.current_file = None
+        if status is not None:
+            status["progress_percent"] = 100.0
+            status["current_file"] = None
 
         logger.info(
             "Ingest complete: %d processed, %d failed",
-            status.processed_files if status else len(files),
-            status.failed_files if status else 0,
+            status["processed_files"] if status else len(files),
+            status["failed_files"] if status else 0,
         )

@@ -1,0 +1,14 @@
+[package]
+name = "bookbrain"
+version = "0.1.0"
+description = "BookBrain - Smart Ebook Manager"
+authors = ["BookBrain"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

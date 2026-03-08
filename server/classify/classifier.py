@@ -80,14 +80,11 @@ for cat, subcats in CATEGORY_RULES.items():
 class Classifier:
     """Two-tier book classifier: rules first, ML fallback."""
 
-    def __init__(self):
-        self._model = None
+    _shared_model = None  # Class-level shared model
+    _model_load_failed = False  # Don't retry if loading failed
 
     def _rule_classify(self, text: str) -> Optional[Dict[str, str]]:
-        """Try to classify using keyword rules.
-
-        Returns dict with category/subcategory or None.
-        """
+        """Try to classify using keyword rules."""
         text_lower = text.lower()
 
         best_match = None
@@ -97,9 +94,8 @@ class Classifier:
             for subcategory, keywords in subcategories.items():
                 score = 0
                 for kw in keywords:
-                    # Count occurrences (bounded)
                     count = len(re.findall(re.escape(kw), text_lower))
-                    score += min(count, 5)  # Cap per keyword
+                    score += min(count, 5)
 
                 if score > best_score:
                     best_score = score
@@ -108,32 +104,31 @@ class Classifier:
                         "subcategory": subcategory,
                     }
 
-        # Require minimum score for rule-based
         if best_score >= 3:
             return best_match
         return None
 
     def _ml_classify(self, text: str) -> Optional[Dict[str, str]]:
-        """Classify using sentence-transformers zero-shot approach.
+        """Classify using sentence-transformers zero-shot approach."""
+        # Skip if model loading already failed
+        if Classifier._model_load_failed:
+            return None
 
-        Computes similarity between text and category labels.
-        """
         try:
-            from sentence_transformers import SentenceTransformer, util
-            from config import settings
-
-            if self._model is None:
+            if Classifier._shared_model is None:
+                from sentence_transformers import SentenceTransformer
+                from config import settings
                 logger.info("Loading embedding model for classification...")
-                self._model = SentenceTransformer(settings.embedding_model)
+                Classifier._shared_model = SentenceTransformer(settings.embedding_model)
+                logger.info("Classification model loaded successfully")
 
-            # Encode text and category labels
-            text_embedding = self._model.encode(text[:1000], convert_to_tensor=True)
-            label_embeddings = self._model.encode(ML_CATEGORIES, convert_to_tensor=True)
+            from sentence_transformers import util
 
-            # Compute cosine similarities
+            text_embedding = Classifier._shared_model.encode(text[:1000], convert_to_tensor=True)
+            label_embeddings = Classifier._shared_model.encode(ML_CATEGORIES, convert_to_tensor=True)
+
             similarities = util.cos_sim(text_embedding, label_embeddings)[0]
 
-            # Get best match
             best_idx = similarities.argmax().item()
             best_score = similarities[best_idx].item()
 
@@ -150,7 +145,8 @@ class Classifier:
             }
 
         except Exception as e:
-            logger.warning("ML classification failed: %s", e)
+            logger.warning("ML classification failed (disabling for this session): %s", e)
+            Classifier._model_load_failed = True
             return None
 
     def classify(
@@ -159,19 +155,10 @@ class Classifier:
         text: str = "",
         author: str = "",
     ) -> Dict[str, str]:
-        """Classify a book using rules then ML fallback.
-
-        Args:
-            title: Book title.
-            text: Book text content (first few thousand chars).
-            author: Book author.
-
-        Returns:
-            Dict with 'category' and optionally 'subcategory'.
-        """
+        """Classify a book using rules then ML fallback."""
         combined = f"{title} {author} {text}"
 
-        # Try rules first (faster)
+        # Try rules first (faster, no network needed)
         result = self._rule_classify(combined)
         if result:
             logger.info("Rule-classified: %s → %s/%s", title[:50], result["category"], result["subcategory"])
@@ -187,5 +174,4 @@ class Classifier:
             )
             return result
 
-        # Default
         return {"category": "Uncategorized", "subcategory": None}

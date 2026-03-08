@@ -1,5 +1,10 @@
 """BookBrain FastAPI application entry point."""
 
+import os
+# Set HuggingFace mirror for China network (must be before any HF imports)
+if not os.environ.get("HF_ENDPOINT"):
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import logging
 from contextlib import asynccontextmanager
 

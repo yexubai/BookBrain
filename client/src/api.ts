@@ -1,8 +1,42 @@
 /**
  * API client for BookBrain backend.
+ *
+ * Supports both local sidecar mode (localhost:8000) and remote NAS mode
+ * (user-configured URL). The backend URL is stored in localStorage.
  */
 
-const API_BASE = '/api';
+const DEFAULT_BACKEND = 'http://localhost:8000';
+const STORAGE_KEY = 'bookbrain_backend_url';
+
+/** Get the configured backend URL. */
+export function getBackendUrl(): string {
+    if (typeof window !== 'undefined') {
+        return localStorage.getItem(STORAGE_KEY) || DEFAULT_BACKEND;
+    }
+    return DEFAULT_BACKEND;
+}
+
+/** Set the backend URL. */
+export function setBackendUrl(url: string) {
+    const cleaned = url.replace(/\/+$/, ''); // Remove trailing slashes
+    localStorage.setItem(STORAGE_KEY, cleaned);
+}
+
+/** Check if running inside Tauri desktop app. */
+export function isTauri(): boolean {
+    return !!(window as any).__TAURI_INTERNALS__;
+}
+
+function getApiBase(): string {
+    // In web dev mode (Vite proxy), use relative path
+    if (!isTauri() && window.location.port === '1420') {
+        return '/api';
+    }
+    // Otherwise use configured backend URL
+    return `${getBackendUrl()}/api`;
+}
+
+// ─── Types ──────────────────────────────────────────
 
 export interface Book {
     id: number;
@@ -79,8 +113,11 @@ export interface Stats {
     total_size_bytes: number;
 }
 
+// ─── API Fetch ──────────────────────────────────────
+
 async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
-    const res = await fetch(`${API_BASE}${url}`, {
+    const base = getApiBase();
+    const res = await fetch(`${base}${url}`, {
         headers: { 'Content-Type': 'application/json' },
         ...options,
     });
@@ -90,6 +127,19 @@ async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
     }
     return res.json();
 }
+
+/** Check if the backend is reachable. */
+export async function checkBackendHealth(): Promise<boolean> {
+    try {
+        const url = getBackendUrl();
+        const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+// ─── API Methods ────────────────────────────────────
 
 export const api = {
     // Books
@@ -120,7 +170,9 @@ export const api = {
     deleteBook: (id: number) =>
         apiFetch<{ message: string }>(`/books/${id}`, { method: 'DELETE' }),
 
-    getCoverUrl: (id: number) => `${API_BASE}/books/${id}/cover`,
+    getCoverUrl: (id: number) => `${getApiBase()}/books/${id}/cover`,
+
+    getFileUrl: (id: number) => `${getApiBase()}/books/${id}/file`,
 
     // Categories
     getCategories: () => apiFetch<Category[]>('/categories'),
