@@ -46,11 +46,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS - allow all origins for development
+# CORS - allow_credentials=True is incompatible with allow_origins=["*"] per CORS spec
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -3,9 +3,9 @@
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, Integer, String, Text, Float, Boolean, DateTime, Index
+    Column, Integer, String, Text, Float, Boolean, DateTime, Index, ForeignKey
 )
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, relationship
 
 
 class Base(DeclarativeBase):
@@ -14,7 +14,12 @@ class Base(DeclarativeBase):
 
 
 class Book(Base):
-    """Ebook metadata and content model."""
+    """Ebook metadata model.
+
+    text_content is stored in a separate BookContent table so that list
+    queries (which never need the full text) don't pay the cost of loading
+    tens of kilobytes per row.
+    """
 
     __tablename__ = "books"
 
@@ -30,10 +35,10 @@ class Book(Base):
     description = Column(Text, default=None)
 
     # File info
-    format = Column(String(10), nullable=False)  # pdf, epub
+    format = Column(String(10), nullable=False)
     file_path = Column(String(1000), nullable=False, unique=True)
-    file_size = Column(Integer, default=0)  # bytes
-    file_hash = Column(String(64), default=None)  # SHA-256
+    file_size = Column(Integer, default=0)
+    file_hash = Column(String(64), default=None, index=True)
 
     # Cover
     cover_path = Column(String(1000), default=None)
@@ -41,30 +46,32 @@ class Book(Base):
     # Classification
     category = Column(String(200), default="Uncategorized", index=True)
     subcategory = Column(String(200), default=None)
-    tags = Column(String(1000), default=None)  # comma-separated
+    tags = Column(String(1000), default=None)
 
-    # Content
+    # Content (kept for backward compat; prefer BookContent for new code)
     summary = Column(Text, default=None)
-    text_content = Column(Text, default=None)  # First N chars for search
+    text_content = Column(Text, default=None)
     page_count = Column(Integer, default=None)
 
     # Vector search
-    vector_id = Column(Integer, default=None)  # FAISS vector index ID
+    vector_id = Column(Integer, default=None)
 
     # Processing status
     ocr_processed = Column(Boolean, default=False)
-    processing_status = Column(String(20), default="pending")  # pending, processing, done, error
+    processing_status = Column(String(20), default="pending")
     processing_error = Column(Text, default=None)
 
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # Indexes for common queries
     __table_args__ = (
+        # Composite indexes covering the most common query patterns
+        Index("idx_books_category_created", "category", "created_at"),
         Index("idx_books_category_title", "category", "title"),
         Index("idx_books_author", "author"),
         Index("idx_books_format", "format"),
+        Index("idx_books_year", "year"),
     )
 
     def __repr__(self) -> str:

@@ -15,11 +15,12 @@ from config import settings
 from db.database import get_session
 from db.crud import (
     get_books, get_book, create_book, update_book, delete_book,
-    get_categories, get_stats, get_book_by_path,
+    get_categories, get_stats, get_book_by_path, fts_search,
 )
 from api.schemas import (
     BookResponse, BookListResponse, BookUpdate,
     CategoryResponse, SearchResult, SearchResponse,
+    UnifiedSearchResult, UnifiedSearchResponse,
     IngestRequest, IngestStatus, SettingsResponse, SettingsUpdate,
     StatsResponse,
 )
@@ -102,6 +103,29 @@ async def delete_book_endpoint(
     return {"message": "Book deleted", "id": book_id}
 
 
+def _is_under_dir(path: Path, allowed_dir: Path) -> bool:
+    """Return True if resolved path is under allowed_dir."""
+    resolved = path.resolve()
+    allowed = allowed_dir.resolve()
+    return str(resolved).startswith(str(allowed) + "/") or resolved == allowed
+
+
+def _safe_cover_path(path: Path) -> Path:
+    """Resolve cover path and verify it is under the covers directory."""
+    resolved = path.resolve()
+    if not _is_under_dir(path, settings.covers_dir):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return resolved
+
+
+def _safe_book_path(path: Path) -> Path:
+    """Resolve book file path and verify it is under an allowed ebook directory."""
+    allowed_dirs = settings.ebook_directories + [settings.data_dir]
+    if not any(_is_under_dir(path, d) for d in allowed_dirs):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return path.resolve()
+
+
 @router.get("/books/{book_id}/cover")
 async def get_book_cover(
     book_id: int,
@@ -112,7 +136,7 @@ async def get_book_cover(
     if not book or not book.cover_path:
         raise HTTPException(status_code=404, detail="Cover not found")
 
-    cover_path = Path(book.cover_path)
+    cover_path = _safe_cover_path(Path(book.cover_path))
     if not cover_path.exists():
         raise HTTPException(status_code=404, detail="Cover file not found")
 
@@ -133,7 +157,7 @@ async def get_book_file(
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    file_path = Path(book.file_path)
+    file_path = _safe_book_path(Path(book.file_path))
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk")
 
@@ -190,6 +214,81 @@ async def search_books(
     )
 
 
+@router.get("/search/unified", response_model=UnifiedSearchResponse)
+async def unified_search(
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+):
+    """Unified search combining FTS5 keyword matching and FAISS semantic search.
+
+    - Keyword results match on title, author, filename, summary, description
+      (including partial/prefix matching, e.g. "Shakesp" finds "Shakespeare")
+    - Semantic results find books by meaning even if exact words don't appear
+    - Results are deduplicated: if a book appears in both, the keyword match
+      takes priority (it's more precise)
+    - keyword_count / semantic_count in the response indicate how many came
+      from each source
+    """
+    from search.vector_store import vector_store
+
+    # Run both searches concurrently
+    fts_task = asyncio.create_task(
+        fts_search(session, q, limit=limit)
+    )
+    vec_task = asyncio.create_task(
+        vector_store.search(q, top_k=limit)
+    )
+    fts_pairs, vec_pairs = await asyncio.gather(fts_task, vec_task)
+
+    seen_ids: set = set()
+    results: list[UnifiedSearchResult] = []
+    keyword_count = 0
+    semantic_count = 0
+
+    # Keyword results first (higher precision)
+    for book, bm25_score in fts_pairs:
+        if book.id in seen_ids:
+            continue
+        seen_ids.add(book.id)
+        # Normalise BM25 to a 0-1 relevance score (BM25 is negative in SQLite)
+        normalised = max(0.0, min(1.0, 1.0 / (1.0 + abs(bm25_score))))
+        results.append(UnifiedSearchResult(
+            book=book,
+            score=normalised,
+            source="keyword",
+            filename=Path(book.file_path).stem if book.file_path else None,
+        ))
+        keyword_count += 1
+
+    # Semantic results — only add books not already in keyword results
+    for book_id, vec_score in vec_pairs:
+        if book_id in seen_ids:
+            continue
+        book = await get_book(session, book_id)
+        if not book:
+            continue
+        seen_ids.add(book_id)
+        results.append(UnifiedSearchResult(
+            book=book,
+            score=float(vec_score),
+            source="semantic",
+            filename=Path(book.file_path).stem if book.file_path else None,
+        ))
+        semantic_count += 1
+
+    # Trim to requested limit
+    results = results[:limit]
+
+    return UnifiedSearchResponse(
+        query=q,
+        results=results,
+        total=len(results),
+        keyword_count=keyword_count,
+        semantic_count=semantic_count,
+    )
+
+
 # ─── Ingest ─────────────────────────────────────────────────────
 
 # Use a plain dict for mutable progress tracking (NOT a Pydantic model)
@@ -202,6 +301,7 @@ _ingest_state: dict = {
     "errors": [],
     "progress_percent": 0.0,
 }
+_ingest_lock = asyncio.Lock()
 
 
 def _reset_state():
@@ -222,30 +322,31 @@ async def trigger_ingest(
     request: IngestRequest = None,
 ):
     """Trigger ebook directory scan and processing."""
-    if _ingest_state["is_running"]:
-        raise HTTPException(status_code=409, detail="Ingest is already running")
+    async with _ingest_lock:
+        if _ingest_state["is_running"]:
+            raise HTTPException(status_code=409, detail="Ingest is already running")
 
-    from ingest.pipeline import IngestPipeline
+        from ingest.pipeline import IngestPipeline
 
-    # Determine directories to scan
-    dirs = []
-    if request and request.directories:
-        dirs = [Path(d) for d in request.directories]
-    else:
-        dirs = settings.ebook_directories
+        # Determine directories to scan
+        dirs = []
+        if request and request.directories:
+            dirs = [Path(d) for d in request.directories]
+        else:
+            dirs = settings.ebook_directories
 
-    if not dirs:
-        raise HTTPException(
-            status_code=400,
-            detail="No directories configured. Set BOOKBRAIN_EBOOK_DIRS or provide directories in request."
-        )
+        if not dirs:
+            raise HTTPException(
+                status_code=400,
+                detail="No directories configured. Set BOOKBRAIN_EBOOK_DIRS or provide directories in request."
+            )
 
-    # Validate directories
-    for d in dirs:
-        if not d.exists():
-            raise HTTPException(status_code=400, detail=f"Directory not found: {d}")
+        # Validate directories
+        for d in dirs:
+            if not d.exists():
+                raise HTTPException(status_code=400, detail=f"Directory not found: {d}")
 
-    _reset_state()
+        _reset_state()
     pipeline = IngestPipeline()
 
     # Run pipeline in background
@@ -316,3 +417,38 @@ async def library_stats(
 ):
     """Get library statistics."""
     return await get_stats(session)
+
+
+# ─── Admin / Maintenance ────────────────────────────────────────
+
+@router.post("/admin/rebuild-fts")
+async def rebuild_fts_index(
+    session: AsyncSession = Depends(get_session),
+):
+    """Rebuild the FTS5 full-text search index from all existing book records.
+
+    Run this once after upgrading from an older version that didn't have FTS5,
+    or after bulk-importing books outside the normal pipeline.
+    """
+    from sqlalchemy import text as sqla_text
+    try:
+        await session.execute(sqla_text("DELETE FROM books_fts"))
+        await session.execute(sqla_text("""
+            INSERT INTO books_fts(rowid, title, author, filename, summary, description)
+            SELECT
+                id,
+                COALESCE(title, ''),
+                COALESCE(author, ''),
+                COALESCE(REPLACE(file_path,
+                    RTRIM(file_path, REPLACE(file_path, '/', '')), ''), ''),
+                COALESCE(summary, ''),
+                COALESCE(description, '')
+            FROM books
+        """))
+        await session.commit()
+        result = await session.execute(sqla_text("SELECT COUNT(*) FROM books_fts"))
+        count = result.scalar()
+        return {"message": f"FTS index rebuilt with {count} entries"}
+    except Exception as e:
+        logger.error("FTS rebuild failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"FTS rebuild failed: {e}")

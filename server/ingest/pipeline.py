@@ -16,6 +16,9 @@ from ingest.ocr import OCRProcessor
 
 logger = logging.getLogger(__name__)
 
+# How many files to process concurrently
+_CONCURRENCY = settings.max_workers
+
 
 class IngestPipeline:
     """Multi-threaded ebook ingest pipeline.
@@ -28,10 +31,9 @@ class IngestPipeline:
         self.scanner = Scanner()
         self.ocr = OCRProcessor()
         self.executor = ThreadPoolExecutor(max_workers=settings.max_workers)
-        self._classifier = None  # Shared classifier instance
+        self._classifier = None
 
     def _get_classifier(self):
-        """Get or create a shared classifier instance."""
         if self._classifier is None:
             try:
                 from classify.classifier import Classifier
@@ -41,21 +43,14 @@ class IngestPipeline:
         return self._classifier
 
     def _process_single_file(self, file_path: Path) -> dict:
-        """Process a single ebook file (runs in thread pool).
-
-        Returns a dict with book data or error info.
-        """
+        """Process a single ebook file (runs in thread pool)."""
         try:
             logger.info("Processing: %s", file_path.name)
 
-            # Extract metadata and text
             metadata = extract_metadata(file_path, settings.max_text_length)
-
-            # File info
             file_hash = compute_file_hash(file_path)
             file_size = file_path.stat().st_size
 
-            # OCR fallback for scanned PDFs
             ocr_processed = False
             if (
                 file_path.suffix.lower() == ".pdf"
@@ -67,7 +62,6 @@ class IngestPipeline:
                     metadata.text_content = ocr_text
                     ocr_processed = True
 
-            # Save cover image
             cover_path = None
             if metadata.cover_image:
                 try:
@@ -78,7 +72,6 @@ class IngestPipeline:
                 except Exception as e:
                     logger.warning("Failed to save cover for %s: %s", file_path.name, e)
 
-            # Classify the book (use shared classifier, rule-based only to avoid slow ML)
             category = "Uncategorized"
             subcategory = None
             try:
@@ -133,99 +126,154 @@ class IngestPipeline:
                 "error": str(e),
             }
 
+    async def _flush_batch(self, batch: list) -> tuple[int, int]:
+        """Commit a batch of processed books to DB. Returns (saved, failed)."""
+        if not batch:
+            return 0, 0
+        saved = 0
+        failed = 0
+        try:
+            async with async_session() as session:
+                books_to_embed = []
+                for result in batch:
+                    if result["success"]:
+                        try:
+                            book = await create_book(session, **result["data"])
+                            books_to_embed.append(book)
+                            saved += 1
+                        except Exception as e:
+                            logger.error("Failed to create book record: %s", e)
+                            failed += 1
+                    else:
+                        failed += 1
+                await session.commit()
+        except Exception as e:
+            logger.error("Batch DB commit failed: %s", e)
+            # Count all as failed if whole batch fails
+            failed = len(batch)
+            saved = 0
+            return saved, failed
+
+        # Batch vector embedding outside the DB session
+        await self._embed_books(books_to_embed)
+
+        return saved, failed
+
+    async def _embed_books(self, books: list) -> None:
+        """Generate and store embeddings for a list of book objects."""
+        if not books:
+            return
+        try:
+            from search.vector_store import vector_store
+            texts = [
+                f"{b.title} {b.author} {b.text_content[:2000] if b.text_content else ''}"
+                for b in books
+            ]
+            ids = [b.id for b in books]
+            vector_ids = await vector_store.add_texts(texts, ids)
+
+            # Update vector_ids in DB
+            updates = [(b.id, vid) for b, vid in zip(books, vector_ids) if vid is not None]
+            if updates:
+                async with async_session() as session:
+                    from db.crud import update_book
+                    for book_id, vid in updates:
+                        await update_book(session, book_id, vector_id=vid)
+                    await session.commit()
+        except Exception as e:
+            logger.warning("Batch vector indexing failed: %s", e)
+
     async def run(self, directories: List[Path], status: dict = None) -> None:
-        """Run the full ingest pipeline.
+        """Run the full ingest pipeline with parallel file processing."""
+        loop = asyncio.get_running_loop()
+        semaphore = asyncio.Semaphore(_CONCURRENCY)
+        counter_lock = asyncio.Lock()
+        batch: list = []
+        batch_lock = asyncio.Lock()
 
-        Args:
-            directories: Directories to scan.
-            status: Mutable dict to update with progress.
-        """
-        # Step 1: Scan for files
-        logger.info("Scanning directories: %s", directories)
-        files = self.scanner.scan(directories)
-
+        # Count files first for accurate progress reporting (fast OS-level scan)
+        logger.info("Counting files in: %s", directories)
+        total = await loop.run_in_executor(self.executor, self.scanner.count, directories)
+        logger.info("Total files to process: %d", total)
         if status is not None:
-            status["total_files"] = len(files)
+            status["total_files"] = total
 
-        if not files:
+        if total == 0:
             logger.info("No ebook files found.")
             return
 
-        logger.info("Starting processing of %d files", len(files))
-        loop = asyncio.get_running_loop()
+        processed_count = 0
+        failed_count = 0
 
-        # Step 2: Process files one by one
-        for idx, file_path in enumerate(files):
-            if status is not None:
-                status["current_file"] = file_path.name
-                status["progress_percent"] = ((idx) / len(files)) * 100
+        async def process_one(file_path: Path) -> None:
+            nonlocal processed_count, failed_count, batch
 
-            # Check if already processed
+            # Skip already-processed files
             try:
                 async with async_session() as session:
                     existing = await get_book_by_path(session, str(file_path))
                     if existing:
-                        logger.info("Skipping already processed: %s", file_path.name)
-                        if status is not None:
-                            status["processed_files"] += 1
-                        continue
+                        logger.debug("Skipping already processed: %s", file_path.name)
+                        async with counter_lock:
+                            processed_count += 1
+                            if status is not None:
+                                status["processed_files"] = processed_count
+                                status["progress_percent"] = (processed_count + failed_count) / total * 100
+                        return
             except Exception as e:
                 logger.error("DB check failed for %s: %s", file_path.name, e)
 
-            # Process in thread pool
-            try:
-                result = await loop.run_in_executor(
-                    self.executor, self._process_single_file, file_path
-                )
-            except Exception as e:
-                logger.error("Thread pool error for %s: %s", file_path.name, e)
-                if status is not None:
-                    status["failed_files"] += 1
-                    status["errors"].append(f"{file_path.name}: {e}")
-                continue
+            if status is not None:
+                status["current_file"] = file_path.name
 
-            if result["success"]:
-                # Save to database
+            async with semaphore:
                 try:
-                    async with async_session() as session:
-                        book = await create_book(session, **result["data"])
-                        await session.commit()
-                        logger.info("Saved book: %s (id=%d)", result["data"]["title"], book.id)
-
-                    # Generate embedding (separate session, non-blocking)
-                    try:
-                        from search.vector_store import vector_store
-                        text_for_embedding = f"{book.title} {book.author} {book.text_content or ''}"
-                        vector_id = await vector_store.add_text(
-                            text_for_embedding[:2000], book.id
-                        )
-                        if vector_id is not None:
-                            async with async_session() as session:
-                                from db.crud import update_book
-                                await update_book(session, book.id, vector_id=vector_id)
-                                await session.commit()
-                    except Exception as e:
-                        logger.warning("Vector indexing skipped for %s: %s", file_path.name, e)
-
-                    if status is not None:
-                        status["processed_files"] += 1
-
+                    result = await loop.run_in_executor(
+                        self.executor, self._process_single_file, file_path
+                    )
                 except Exception as e:
-                    logger.error("Failed to save %s: %s\n%s", file_path.name, e, traceback.format_exc())
+                    logger.error("Thread pool error for %s: %s", file_path.name, e)
+                    result = {"success": False, "file_path": str(file_path), "error": str(e)}
+
+            # Accumulate into batch
+            flush_now = False
+            async with batch_lock:
+                batch.append(result)
+                if len(batch) >= settings.db_batch_size:
+                    current_batch, batch = batch, []
+                    flush_now = True
+
+            if flush_now:
+                saved, failed = await self._flush_batch(current_batch)
+                async with counter_lock:
+                    processed_count += saved
+                    failed_count += failed
                     if status is not None:
-                        status["failed_files"] += 1
-                        status["errors"].append(f"{file_path.name}: DB save error: {e}")
+                        status["processed_files"] = processed_count
+                        status["failed_files"] = failed_count
+                        status["progress_percent"] = (processed_count + failed_count) / total * 100
+                        if result.get("error"):
+                            status["errors"].append(f"{result['file_path']}: {result['error']}")
             else:
-                if status is not None:
-                    status["failed_files"] += 1
+                if not result["success"] and status is not None:
                     status["errors"].append(f"{result['file_path']}: {result['error']}")
+
+        # Launch all tasks; semaphore limits actual concurrency
+        tasks = [process_one(fp) for fp in self.scanner.scan_iter(directories)]
+        await asyncio.gather(*tasks)
+
+        # Flush remaining batch
+        async with batch_lock:
+            remaining, batch = batch, []
+        if remaining:
+            saved, failed = await self._flush_batch(remaining)
+            processed_count += saved
+            failed_count += failed
 
         if status is not None:
             status["progress_percent"] = 100.0
+            status["processed_files"] = processed_count
+            status["failed_files"] = failed_count
             status["current_file"] = None
 
-        logger.info(
-            "Ingest complete: %d processed, %d failed",
-            status["processed_files"] if status else len(files),
-            status["failed_files"] if status else 0,
-        )
+        logger.info("Ingest complete: %d processed, %d failed", processed_count, failed_count)

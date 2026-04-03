@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { api, Book, BookListResponse } from '../api'
 import BookDetail from '../components/BookDetail'
 import { FiGrid, FiList, FiBook } from 'react-icons/fi'
@@ -20,16 +20,31 @@ export default function LibraryPage({ selectedCategory, searchQuery }: LibraryPa
     const [view, setView] = useState<'grid' | 'list'>('grid')
     const [page, setPage] = useState(1)
     const [selectedBook, setSelectedBook] = useState<Book | null>(null)
+    // Debounced query — only fires API request 400ms after user stops typing
+    const [debouncedQuery, setDebouncedQuery] = useState(searchQuery)
     const pageSize = 20
+    const abortRef = useRef<AbortController | null>(null)
+
+    useEffect(() => {
+        const timer = setTimeout(() => setDebouncedQuery(searchQuery), 400)
+        return () => clearTimeout(timer)
+    }, [searchQuery])
+
+    useEffect(() => {
+        setPage(1)
+    }, [selectedCategory, debouncedQuery])
 
     const fetchBooks = useCallback(async () => {
+        // Cancel any in-flight request before starting a new one
+        if (abortRef.current) abortRef.current.abort()
+        abortRef.current = new AbortController()
         setLoading(true)
         try {
             const result = await api.getBooks({
                 page,
                 page_size: pageSize,
                 category: selectedCategory || undefined,
-                q: searchQuery || undefined,
+                q: debouncedQuery || undefined,
             })
             setData(result)
         } catch (e) {
@@ -37,17 +52,14 @@ export default function LibraryPage({ selectedCategory, searchQuery }: LibraryPa
         } finally {
             setLoading(false)
         }
-    }, [page, selectedCategory, searchQuery])
-
-    useEffect(() => {
-        setPage(1)
-    }, [selectedCategory, searchQuery])
+    }, [page, selectedCategory, debouncedQuery])
 
     useEffect(() => {
         fetchBooks()
     }, [fetchBooks])
 
-    if (loading) {
+    // Show spinner only on first load; keep stale data visible during page changes
+    if (loading && !data) {
         return <div className="loading"><div className="spinner" /></div>
     }
 
@@ -56,7 +68,7 @@ export default function LibraryPage({ selectedCategory, searchQuery }: LibraryPa
     const totalPages = data?.total_pages || 0
 
     return (
-        <div>
+        <div style={{ opacity: loading ? 0.6 : 1, transition: 'opacity 0.15s' }}>
             <div className="page-header">
                 <div>
                     <h2>{selectedCategory || 'All Books'}</h2>

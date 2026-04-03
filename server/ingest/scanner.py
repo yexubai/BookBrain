@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import List, Set
+from typing import Generator, List, Set, Tuple
 
 from config import settings
 
@@ -15,35 +15,26 @@ class Scanner:
     def __init__(self):
         self.supported_formats: Set[str] = set(settings.supported_formats)
 
-    def scan(self, directories: List[Path]) -> List[Path]:
-        """Scan directories for ebook files.
-
-        Args:
-            directories: List of directories to scan.
-
-        Returns:
-            List of found ebook file paths.
-        """
-        found_files = []
-
+    def scan_iter(self, directories: List[Path]) -> Generator[Path, None, None]:
+        """Yield ebook file paths one by one without loading all into memory."""
         for directory in directories:
             if not directory.exists():
                 logger.warning("Directory does not exist: %s", directory)
                 continue
-
             if not directory.is_dir():
                 logger.warning("Path is not a directory: %s", directory)
                 continue
-
             logger.info("Scanning directory: %s", directory)
-            count = 0
-
             for file_path in directory.rglob("*"):
                 if file_path.is_file() and file_path.suffix.lower() in self.supported_formats:
-                    found_files.append(file_path)
-                    count += 1
+                    yield file_path
 
-            logger.info("Found %d ebook(s) in %s", count, directory)
+    def count(self, directories: List[Path]) -> int:
+        """Count ebook files without storing paths."""
+        return sum(1 for _ in self.scan_iter(directories))
 
+    def scan(self, directories: List[Path]) -> List[Path]:
+        """Scan directories for ebook files (kept for compatibility)."""
+        found_files = list(self.scan_iter(directories))
         logger.info("Total ebooks found: %d", len(found_files))
         return found_files

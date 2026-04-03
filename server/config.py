@@ -50,7 +50,8 @@ class Settings(BaseSettings):
     # Processing
     max_workers: int = Field(default=4, description="Max threads for processing")
     max_text_length: int = 50000  # Max chars of text to store per book
-    batch_size: int = 32  # Batch size for embedding
+    batch_size: int = 32          # Batch size for embedding
+    db_batch_size: int = 50       # Books to accumulate before a batch DB commit
 
     # Supported formats
     supported_formats: List[str] = [".pdf", ".epub", ".mobi", ".azw3", ".txt", ".cbz", ".html"]

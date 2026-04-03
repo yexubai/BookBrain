@@ -92,6 +92,25 @@ class SearchResponse(BaseModel):
     total: int
 
 
+class UnifiedSearchResult(BaseModel):
+    """Single result from unified search (keyword + semantic combined)."""
+    book: BookResponse
+    score: float = 0.0
+    # "keyword" = FTS5 match on title/author/filename/summary
+    # "semantic" = FAISS vector similarity match
+    source: str = "keyword"
+    filename: Optional[str] = None   # file stem for display
+
+
+class UnifiedSearchResponse(BaseModel):
+    """Response from the unified search endpoint."""
+    query: str
+    results: List[UnifiedSearchResult]
+    total: int
+    keyword_count: int = 0
+    semantic_count: int = 0
+
+
 # ─── Ingest Schemas ─────────────────────────────────────────────
 
 class IngestRequest(BaseModel):

@@ -221,7 +221,6 @@ def extract_epub(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
 
 def extract_txt(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     """Extract metadata and text from a TXT file."""
-    metadata = BookMetadata.title = file_path.stem
     metadata = BookMetadata(title=file_path.stem)
     try:
         # Try to read with UTF-8, fallback to other encodings

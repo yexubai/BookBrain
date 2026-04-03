@@ -10,16 +10,25 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Save index to disk after this many additions (reduces I/O dramatically)
+_SAVE_EVERY = 500
+
 
 class VectorStore:
-    """FAISS-based vector store for semantic book search."""
+    """FAISS-based vector store for semantic book search.
+
+    Uses IndexHNSWFlat for fast approximate nearest-neighbour search,
+    which scales well to hundreds of thousands of vectors without the
+    brute-force O(n) cost of IndexFlatIP.
+    """
 
     def __init__(self):
         self._model = None
-        self._model_load_failed = False  # Don't retry if loading failed
+        self._model_load_failed = False
         self._index = None
-        self._id_map: dict = {}  # vector_idx -> book_id
+        self._id_map: dict = {}      # vector_idx -> book_id
         self._next_id: int = 0
+        self._additions_since_save: int = 0
         self._index_path = settings.index_dir / "faiss.index"
         self._map_path = settings.index_dir / "id_map.npy"
 
@@ -27,7 +36,6 @@ class VectorStore:
         """Lazy-load the sentence-transformer model."""
         if self._model_load_failed:
             return None
-
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
@@ -38,11 +46,10 @@ class VectorStore:
                 logger.warning("Failed to load embedding model (disabling vector search): %s", e)
                 self._model_load_failed = True
                 return None
-
         return self._model
 
     def _get_index(self):
-        """Get or create the FAISS index."""
+        """Get or create the FAISS index (HNSW for fast ANN search)."""
         if self._index is None:
             import faiss
 
@@ -54,8 +61,15 @@ class VectorStore:
                     self._id_map = data.get("id_map", {})
                     self._next_id = data.get("next_id", 0)
             else:
-                logger.info("Creating new FAISS index (dim=%d)", settings.embedding_dimension)
-                self._index = faiss.IndexFlatIP(settings.embedding_dimension)
+                logger.info(
+                    "Creating new FAISS HNSW index (dim=%d)", settings.embedding_dimension
+                )
+                # HNSW: fast approximate search, no training required,
+                # scales to millions of vectors with ~10ms query latency.
+                # M=32 is a good balance of speed/accuracy/memory.
+                self._index = faiss.IndexHNSWFlat(settings.embedding_dimension, 32)
+                self._index.hnsw.efConstruction = 200  # Higher = better quality graph
+                self._index.hnsw.efSearch = 64         # Higher = better recall at query time
                 self._id_map = {}
                 self._next_id = 0
 
@@ -66,7 +80,6 @@ class VectorStore:
         import faiss
 
         settings.index_dir.mkdir(parents=True, exist_ok=True)
-
         if self._index is not None:
             faiss.write_index(self._index, str(self._index_path))
             np.save(
@@ -74,42 +87,65 @@ class VectorStore:
                 {"id_map": self._id_map, "next_id": self._next_id},
             )
             logger.info("FAISS index saved (%d vectors)", self._index.ntotal)
+        self._additions_since_save = 0
 
-    def _encode(self, text: str) -> Optional[np.ndarray]:
-        """Encode text to a normalized embedding vector."""
+    def _encode_batch(self, texts: List[str]) -> Optional[np.ndarray]:
+        """Encode a batch of texts to normalised embedding vectors."""
         model = self._get_model()
         if model is None:
             return None
-        embedding = model.encode(text, normalize_embeddings=True)
-        return embedding.reshape(1, -1).astype("float32")
+        embeddings = model.encode(
+            texts,
+            normalize_embeddings=True,
+            batch_size=settings.batch_size,
+            show_progress_bar=False,
+        )
+        return embeddings.astype("float32")
 
-    async def add_text(self, text: str, book_id: int) -> Optional[int]:
-        """Add a text entry to the vector store."""
-        if self._model_load_failed:
+    def _encode(self, text: str) -> Optional[np.ndarray]:
+        """Encode a single text to a normalised embedding vector."""
+        result = self._encode_batch([text])
+        if result is None:
             return None
+        return result[0:1]
+
+    async def add_texts(self, texts: List[str], book_ids: List[int]) -> List[Optional[int]]:
+        """Add multiple texts to the vector store in one batch. Returns list of vector IDs."""
+        if self._model_load_failed or not texts:
+            return [None] * len(texts)
 
         try:
             loop = asyncio.get_running_loop()
-            vector = await loop.run_in_executor(None, self._encode, text)
+            vectors = await loop.run_in_executor(None, self._encode_batch, texts)
 
-            if vector is None:
-                return None
+            if vectors is None:
+                return [None] * len(texts)
 
             index = self._get_index()
-            vector_id = self._next_id
-            index.add(vector)
-            self._id_map[vector_id] = book_id
-            self._next_id += 1
+            start_id = self._next_id
+            index.add(vectors)
 
-            # Save periodically
-            if self._next_id % 10 == 0:
+            vector_ids = []
+            for i, book_id in enumerate(book_ids):
+                vid = start_id + i
+                self._id_map[vid] = book_id
+                vector_ids.append(vid)
+            self._next_id += len(texts)
+            self._additions_since_save += len(texts)
+
+            if self._additions_since_save >= _SAVE_EVERY:
                 await loop.run_in_executor(None, self._save_index)
 
-            return vector_id
+            return vector_ids
 
         except Exception as e:
-            logger.error("Failed to add vector for book %d: %s", book_id, e)
-            return None
+            logger.error("Failed to add vectors: %s", e)
+            return [None] * len(texts)
+
+    async def add_text(self, text: str, book_id: int) -> Optional[int]:
+        """Add a single text entry to the vector store."""
+        ids = await self.add_texts([text], [book_id])
+        return ids[0]
 
     async def search(
         self, query: str, top_k: int = 20
@@ -157,9 +193,12 @@ class VectorStore:
 
         logger.info("Rebuilding FAISS index with %d entries", len(texts_and_ids))
 
-        self._index = faiss.IndexFlatIP(settings.embedding_dimension)
+        self._index = faiss.IndexHNSWFlat(settings.embedding_dimension, 32)
+        self._index.hnsw.efConstruction = 200
+        self._index.hnsw.efSearch = 64
         self._id_map = {}
         self._next_id = 0
+        self._additions_since_save = 0
 
         model = self._get_model()
         if model is None:
@@ -170,14 +209,16 @@ class VectorStore:
         ids = [i for _, i in texts_and_ids]
 
         for batch_start in range(0, len(texts), settings.batch_size):
-            batch_texts = texts[batch_start : batch_start + settings.batch_size]
-            batch_ids = ids[batch_start : batch_start + settings.batch_size]
+            batch_texts = texts[batch_start: batch_start + settings.batch_size]
+            batch_ids = ids[batch_start: batch_start + settings.batch_size]
 
             embeddings = model.encode(
-                batch_texts, normalize_embeddings=True, batch_size=settings.batch_size
+                batch_texts,
+                normalize_embeddings=True,
+                batch_size=settings.batch_size,
+                show_progress_bar=False,
             )
             embeddings = embeddings.astype("float32")
-
             self._index.add(embeddings)
 
             for book_id in batch_ids:

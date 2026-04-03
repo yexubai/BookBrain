@@ -45,6 +45,12 @@ export default function SettingsPage() {
     }, [])
 
     const applyBackendUrl = () => {
+        try {
+            new URL(backendUrl)
+        } catch {
+            showToast('error', 'Invalid URL format')
+            return
+        }
         setBackendUrl(backendUrl)
         showToast('info', 'Backend URL updated')
         checkConnection()

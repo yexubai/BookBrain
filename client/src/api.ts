@@ -87,6 +87,22 @@ export interface SearchResponse {
     total: number;
 }
 
+export interface UnifiedSearchResult {
+    book: Book;
+    score: number;
+    /** "keyword" = FTS5 title/author/filename match; "semantic" = vector similarity */
+    source: 'keyword' | 'semantic';
+    filename?: string;
+}
+
+export interface UnifiedSearchResponse {
+    query: string;
+    results: UnifiedSearchResult[];
+    total: number;
+    keyword_count: number;
+    semantic_count: number;
+}
+
 export interface IngestStatus {
     is_running: boolean;
     total_files: number;
@@ -182,6 +198,12 @@ export const api = {
         const qs = new URLSearchParams({ q });
         if (limit) qs.set('limit', String(limit));
         return apiFetch<SearchResponse>(`/search?${qs}`);
+    },
+
+    searchUnified: (q: string, limit?: number) => {
+        const qs = new URLSearchParams({ q });
+        if (limit) qs.set('limit', String(limit));
+        return apiFetch<UnifiedSearchResponse>(`/search/unified?${qs}`);
     },
 
     // Ingest

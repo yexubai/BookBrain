@@ -13,9 +13,9 @@ export default function Topbar({ searchQuery, onSearchChange }: TopbarProps) {
     const [connected, setConnected] = useState<boolean | null>(null)
 
     useEffect(() => {
-        checkBackendHealth().then(setConnected)
+        checkBackendHealth().then(setConnected).catch(() => setConnected(false))
         const interval = setInterval(() => {
-            checkBackendHealth().then(setConnected)
+            checkBackendHealth().then(setConnected).catch(() => setConnected(false))
         }, 15000) // Check every 15s
         return () => clearInterval(interval)
     }, [])

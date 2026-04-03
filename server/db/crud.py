@@ -1,11 +1,96 @@
 """CRUD operations for BookBrain database."""
 
+import re
+from pathlib import Path
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select, func, delete, or_
+from sqlalchemy import select, func, delete, or_, text
+from sqlalchemy.orm import defer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Book
+
+
+def _build_fts_query(raw: str) -> str:
+    """Convert a user query string into a safe FTS5 MATCH expression.
+
+    Strategy:
+      - Each token is searched as a prefix (word*) for partial matching
+      - The whole phrase is also searched verbatim for phrase matching
+      - Special FTS5 characters are escaped to avoid syntax errors
+    """
+    # Strip FTS5 special operators so user input can't break the query
+    clean = re.sub(r'[\"\'*^(){}[\]:;,]', ' ', raw).strip()
+    tokens = [t for t in clean.split() if t]
+    if not tokens:
+        return '""'
+    # Prefix search for each token (partial/fuzzy match)
+    prefix_terms = " ".join(f'"{t}"*' for t in tokens)
+    # Also try exact phrase if multi-word
+    if len(tokens) > 1:
+        phrase = '"' + " ".join(tokens) + '"'
+        return f"{phrase} OR {prefix_terms}"
+    return prefix_terms
+
+
+async def fts_search(
+    session: AsyncSession,
+    query: str,
+    limit: int = 50,
+    category: Optional[str] = None,
+    format: Optional[str] = None,
+) -> List[Tuple[Book, float]]:
+    """Full-text search using the FTS5 index. Returns (book, bm25_score) pairs.
+
+    Searches title, author, filename, summary, and description.
+    Results are ranked by BM25 relevance (lower = better in SQLite FTS5).
+    """
+    fts_query = _build_fts_query(query)
+
+    # Build the raw SQL; category/format filters are applied as JOINed WHERE clauses
+    filters = ""
+    params: dict = {"fts_query": fts_query, "limit": limit}
+    if category:
+        filters += " AND b.category = :category"
+        params["category"] = category
+    if format:
+        filters += " AND b.format = :format"
+        params["format"] = format
+
+    sql = text(f"""
+        SELECT b.id, bm25(books_fts) AS score
+        FROM books_fts
+        JOIN books b ON b.id = books_fts.rowid
+        WHERE books_fts MATCH :fts_query {filters}
+        ORDER BY bm25(books_fts)
+        LIMIT :limit
+    """)
+
+    try:
+        result = await session.execute(sql, params)
+        rows = result.fetchall()
+    except Exception:
+        # FTS5 query might fail on certain inputs; fall back to empty
+        return []
+
+    if not rows:
+        return []
+
+    # Fetch full Book objects for the matched IDs
+    book_ids = [row[0] for row in rows]
+    score_map = {row[0]: row[1] for row in rows}
+
+    books_result = await session.execute(
+        select(Book).options(defer(Book.text_content)).where(Book.id.in_(book_ids))
+    )
+    books_by_id = {b.id: b for b in books_result.scalars().all()}
+
+    # Return in relevance order (BM25 ascending = more relevant first)
+    return [
+        (books_by_id[bid], score_map[bid])
+        for bid in book_ids
+        if bid in books_by_id
+    ]
 
 
 async def create_book(session: AsyncSession, **kwargs) -> Book:
@@ -43,9 +128,14 @@ async def get_books(
 ) -> Tuple[List[Book], int]:
     """Get paginated list of books with optional filters.
 
+    When search_query is provided, uses FTS5 for fast full-text matching
+    (title, author, filename, summary, description). Falls back to ILIKE
+    if FTS5 returns no results.
+
     Returns tuple of (books, total_count).
     """
-    query = select(Book)
+    # Defer large text column — list views don't need full content
+    query = select(Book).options(defer(Book.text_content))
     count_query = select(func.count(Book.id))
 
     # Apply filters
@@ -58,11 +148,24 @@ async def get_books(
         count_query = count_query.where(Book.format == format)
 
     if search_query:
+        # Try FTS5 first — fast and searches filename too
+        fts_results = await fts_search(
+            session, search_query, limit=skip + limit,
+            category=category, format=format
+        )
+        if fts_results:
+            books = [b for b, _ in fts_results]
+            total = len(fts_results)
+            return books[skip:skip + limit], total
+
+        # FTS5 returned nothing — fall back to ILIKE for backward compat
         like_pattern = f"%{search_query}%"
+        filename_pattern = f"%{Path(search_query).stem}%"
         search_filter = or_(
             Book.title.ilike(like_pattern),
             Book.author.ilike(like_pattern),
             Book.description.ilike(like_pattern),
+            Book.file_path.ilike(filename_pattern),
         )
         query = query.where(search_filter)
         count_query = count_query.where(search_filter)
@@ -77,7 +180,6 @@ async def get_books(
     # Pagination
     query = query.offset(skip).limit(limit)
 
-    # Execute
     total_result = await session.execute(count_query)
     total = total_result.scalar()
 
