@@ -179,7 +179,10 @@ class VectorStore:
                     continue
                 book_id = self._id_map.get(int(idx))
                 if book_id is not None:
-                    results.append((book_id, float(score)))
+                    # Convert L2 distance to a 0.0-1.0 similarity score
+                    # (1.0 = perfect match, lower = less similar)
+                    similarity = 1.0 / (1.0 + float(score))
+                    results.append((book_id, similarity))
 
             return results
 
