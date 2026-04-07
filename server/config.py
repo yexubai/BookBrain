@@ -39,8 +39,8 @@ class Settings(BaseSettings):
 
     # OCR
     ocr_enabled: bool = True
-    ocr_language: str = "eng+chi_sim"
-    ocr_max_pages: int = 10  # Max pages to OCR per book
+    ocr_language: str = "ch_sim+en"  # EasyOCR language codes
+    ocr_max_pages: int = 20
     scanned_text_threshold: float = 0.1  # Below this ratio, consider PDF as scanned
 
     # ML Model
@@ -48,8 +48,11 @@ class Settings(BaseSettings):
     embedding_dimension: int = 384
 
     # Processing
-    max_workers: int = Field(default=4, description="Max threads for processing")
-    max_text_length: int = 50000  # Max chars of text to store per book
+    max_workers: int = Field(
+        default=max(1, (os.cpu_count() or 4) // 2), 
+        description="Max threads for processing (half of logical cores)"
+    )
+    max_text_length: int = 2000000  # Max chars of text to store per book (full-text search)
     batch_size: int = 32          # Batch size for embedding
     db_batch_size: int = 50       # Books to accumulate before a batch DB commit
 
@@ -68,6 +71,39 @@ class Settings(BaseSettings):
         if not self.ebook_dirs:
             return []
         return [Path(d.strip()) for d in self.ebook_dirs.split(",") if d.strip()]
+
+    def save_to_disk(self) -> None:
+        """Save settings to a JSON file."""
+        import json
+        settings_path = self.data_dir / "user_settings.json"
+        data = {
+            "ebook_dirs": self.ebook_dirs,
+            "ocr_enabled": self.ocr_enabled,
+            "ocr_language": self.ocr_language,
+            "max_workers": self.max_workers,
+            "ocr_max_pages": self.ocr_max_pages,
+            "max_text_length": self.max_text_length,
+        }
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
+    def load_from_disk(self) -> None:
+        """Load settings from a JSON file if it exists."""
+        self.ensure_directories()
+        settings_path = self.data_dir / "user_settings.json"
+        if not settings_path.exists():
+            return
+        
+        import json
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for key, value in data.items():
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+        except Exception as e:
+            # We don't have a logger initialized yet in config.py easily, but it's safe to print here
+            print(f"Warning: Could not load user settings: {e}")
 
     def ensure_directories(self) -> None:
         """Create required directories."""

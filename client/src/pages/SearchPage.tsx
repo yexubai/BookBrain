@@ -76,7 +76,7 @@ export default function SearchPage({ query }: SearchPageProps) {
                 </div>
             ) : (
                 <div className="search-results">
-                    {results.map(({ book, score, source, filename }) => (
+                    {results.map(({ book, score, source, filename, context }) => (
                         <div key={book.id} className="search-result-item" onClick={() => setSelectedBook(book)}>
                             <div className="result-cover">
                                 {book.cover_path ? (
@@ -91,11 +91,22 @@ export default function SearchPage({ query }: SearchPageProps) {
                                 <div className="result-title">{book.title}</div>
                                 <div className="result-author">{book.author}</div>
                                 {filename && filename !== book.title && (
-                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
-                                        📄 {filename}
+                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                        <span style={{ opacity: 0.7 }}>📄</span> {filename}
                                     </div>
                                 )}
                                 <div className="result-summary">{book.summary || 'No summary available'}</div>
+                                {context && (
+                                    <div className="result-context">
+                                        <span style={{ fontSize: '10px', color: 'var(--accent)', fontWeight: 'bold', marginRight: '6px', textTransform: 'uppercase', letterSpacing: '0.03em' }}>
+                                            Matched text
+                                        </span>
+                                        <div 
+                                            style={{ display: 'inline', fontSize: '12.5px', color: 'var(--text-secondary)', lineHeight: '1.5' }}
+                                            dangerouslySetInnerHTML={{ __html: context }} 
+                                        />
+                                    </div>
+                                )}
                             </div>
                             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', minWidth: '80px' }}>
                                 <div className="result-score">{(score * 100).toFixed(0)}%</div>

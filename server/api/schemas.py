@@ -83,6 +83,7 @@ class SearchResult(BaseModel):
     """Single search result."""
     book: BookResponse
     score: float = 0.0
+    context: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -96,10 +97,11 @@ class UnifiedSearchResult(BaseModel):
     """Single result from unified search (keyword + semantic combined)."""
     book: BookResponse
     score: float = 0.0
-    # "keyword" = FTS5 match on title/author/filename/summary
+    # "keyword" = FTS5 match on title/author/filename/summary/content
     # "semantic" = FAISS vector similarity match
     source: str = "keyword"
     filename: Optional[str] = None   # file stem for display
+    context: Optional[str] = None    # Match snippet with <b> tags
 
 
 class UnifiedSearchResponse(BaseModel):
@@ -161,3 +163,48 @@ class StatsResponse(BaseModel):
     formats: dict = {}
     category_count: int = 0
     total_size_bytes: int = 0
+
+
+# ─── File Browser Schemas ───────────────────────────────────────
+
+class FileBrowserItem(BaseModel):
+    """Directory or file item."""
+    name: str
+    path: str
+    is_dir: bool
+    size: Optional[int] = None
+
+
+class FileBrowserResponse(BaseModel):
+    """List of files and directories in a path."""
+    current_path: str
+    parent_path: Optional[str] = None
+    items: List[FileBrowserItem]
+
+
+# ─── Annotation Schemas ─────────────────────────────────────────
+
+class AnnotationBase(BaseModel):
+    """Base annotation properties."""
+    location: str
+    selected_text: str
+    note: Optional[str] = ""
+    color: Optional[str] = "yellow"
+
+class AnnotationCreate(AnnotationBase):
+    """Schema for creating a new annotation."""
+    pass
+
+class AnnotationUpdate(BaseModel):
+    """Schema for updating an annotation."""
+    note: Optional[str] = None
+    color: Optional[str] = None
+
+class AnnotationResponse(AnnotationBase):
+    """Annotation response model."""
+    id: int
+    book_id: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}

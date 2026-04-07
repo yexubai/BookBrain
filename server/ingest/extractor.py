@@ -34,7 +34,7 @@ def compute_file_hash(file_path: Path) -> str:
     return sha256.hexdigest()
 
 
-def extract_pdf(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+def extract_pdf(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
     """Extract metadata and text from a PDF file using PyMuPDF."""
     import fitz  # PyMuPDF
 
@@ -96,7 +96,7 @@ def extract_pdf(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     return metadata
 
 
-def extract_epub(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+def extract_epub(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
     """Extract metadata and text from an EPUB file."""
     import ebooklib
     from ebooklib import epub
@@ -219,7 +219,7 @@ def extract_epub(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     return metadata
 
 
-def extract_txt(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+def extract_txt(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
     """Extract metadata and text from a TXT file."""
     metadata = BookMetadata(title=file_path.stem)
     try:
@@ -247,7 +247,7 @@ def extract_txt(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     return metadata
 
 
-def extract_html(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+def extract_html(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
     """Extract text from HTML file."""
     metadata = BookMetadata(title=file_path.stem)
     try:
@@ -272,7 +272,7 @@ def extract_html(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
     return metadata
 
 
-def extract_mobi_azw3(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+def extract_mobi_azw3(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
     """Basic extraction for Kindle formats (MOBI/AZW3).
     Requires 'mobi' package for full extraction, doing basic fallback for now.
     """
@@ -325,7 +325,7 @@ def extract_cbz(file_path: Path) -> BookMetadata:
     return metadata
 
 
-def extract_metadata(file_path: Path, max_text_length: int = 50000) -> BookMetadata:
+def extract_metadata(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
     """Extract metadata and text from an ebook file.
 
     Dispatches to format-specific extractors.

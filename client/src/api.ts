@@ -79,6 +79,7 @@ export interface Category {
 export interface SearchResult {
     book: Book;
     score: number;
+    context?: string;
 }
 
 export interface SearchResponse {
@@ -90,9 +91,10 @@ export interface SearchResponse {
 export interface UnifiedSearchResult {
     book: Book;
     score: number;
-    /** "keyword" = FTS5 title/author/filename match; "semantic" = vector similarity */
+    /** "keyword" = FTS5 title/author/filename/content match; "semantic" = vector similarity */
     source: 'keyword' | 'semantic';
     filename?: string;
+    context?: string;
 }
 
 export interface UnifiedSearchResponse {
@@ -113,6 +115,19 @@ export interface IngestStatus {
     progress_percent: number;
 }
 
+export interface FileBrowserItem {
+    name: string;
+    path: string;
+    is_dir: boolean;
+    size?: number;
+}
+
+export interface FileBrowserResponse {
+    current_path: string;
+    parent_path?: string;
+    items: FileBrowserItem[];
+}
+
 export interface Settings {
     ebook_dirs: string;
     ocr_enabled: boolean;
@@ -120,6 +135,17 @@ export interface Settings {
     embedding_model: string;
     max_workers: number;
     data_dir: string;
+}
+
+export interface Annotation {
+    id: number;
+    book_id: number;
+    location: string;
+    selected_text: string;
+    note: string;
+    color: string;
+    created_at: string;
+    updated_at: string;
 }
 
 export interface Stats {
@@ -207,10 +233,10 @@ export const api = {
     },
 
     // Ingest
-    triggerIngest: (directories?: string[]) =>
+    triggerIngest: (params: { directories?: string[]; force_rescan?: boolean } = {}) =>
         apiFetch<IngestStatus>('/ingest', {
             method: 'POST',
-            body: JSON.stringify({ directories }),
+            body: JSON.stringify(params),
         }),
 
     getIngestStatus: () => apiFetch<IngestStatus>('/ingest/status'),
@@ -226,4 +252,29 @@ export const api = {
 
     // Stats
     getStats: () => apiFetch<Stats>('/stats'),
+
+    // Admin
+    browseFiles: (path?: string) => {
+        const qs = new URLSearchParams();
+        if (path) qs.set('path', path);
+        return apiFetch<FileBrowserResponse>(`/admin/browse?${qs}`);
+    },
+
+    // Annotations
+    getAnnotations: (bookId: number) => apiFetch<Annotation[]>(`/books/${bookId}/annotations`),
+    
+    createAnnotation: (bookId: number, data: { location: string; selected_text: string; note?: string; color?: string }) =>
+        apiFetch<Annotation>(`/books/${bookId}/annotations`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+        
+    updateAnnotation: (annotationId: number, data: { note?: string; color?: string }) =>
+        apiFetch<Annotation>(`/annotations/${annotationId}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        }),
+        
+    deleteAnnotation: (annotationId: number) =>
+        apiFetch<{ message: string }>(`/annotations/${annotationId}`, { method: 'DELETE' }),
 };

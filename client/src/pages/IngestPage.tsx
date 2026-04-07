@@ -1,26 +1,85 @@
-import { useState, useEffect, useRef } from 'react'
-import { api, IngestStatus, Stats } from '../api'
-import { FiUploadCloud, FiCheckCircle, FiAlertCircle } from 'react-icons/fi'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { api, IngestStatus, Stats, isTauri } from '../api'
+import { FiUploadCloud, FiCheckCircle, FiAlertCircle, FiFolder } from 'react-icons/fi'
+import FileBrowser from '../components/FileBrowser'
 
 export default function IngestPage() {
     const [status, setStatus] = useState<IngestStatus | null>(null)
     const [stats, setStats] = useState<Stats | null>(null)
     const [dirs, setDirs] = useState('')
+    const [forceRescan, setForceRescan] = useState(false)
     const [loading, setLoading] = useState(false)
     const [toast, setToast] = useState<{ type: string; msg: string } | null>(null)
     const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-    useEffect(() => {
-        api.getIngestStatus().then(setStatus).catch(() => { })
-        api.getStats().then(setStats).catch(() => { })
-        return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    const [showBrowser, setShowBrowser] = useState(false)
+
+    const loadData = useCallback(async () => {
+        try {
+            const [statusRes, statsRes, settingsRes] = await Promise.all([
+                api.getIngestStatus(),
+                api.getStats(),
+                api.getSettings()
+            ])
+            setStatus(statusRes)
+            setStats(statsRes)
+            if (settingsRes.ebook_dirs) {
+                setDirs(settingsRes.ebook_dirs)
+            }
+        } catch (e) {
+            console.error('Failed to load ingest data:', e)
+        }
     }, [])
+
+    useEffect(() => {
+        loadData()
+        return () => { if (pollRef.current) clearInterval(pollRef.current) }
+    }, [loadData])
+
+    const handleBrowse = async () => {
+        if (isTauri()) {
+            try {
+                const { open } = await import('@tauri-apps/plugin-dialog')
+                const selected = await open({
+                    directory: true,
+                    multiple: true,
+                    defaultPath: dirs.split(',')[0]?.trim() || undefined
+                })
+                if (selected) {
+                    const newPath = Array.isArray(selected) ? selected.join(', ') : selected
+                    setDirs(newPath)
+                    // Auto-save to settings
+                    await api.updateSettings({ ebook_dirs: newPath })
+                }
+            } catch (e) {
+                console.error('Tauri dialog error:', e)
+                setShowBrowser(true) // Fallback to server-side browser
+            }
+        } else {
+            setShowBrowser(true)
+        }
+    }
+
+    const onBrowserSelect = async (path: string) => {
+        const newDirs = dirs ? `${dirs}, ${path}` : path
+        setDirs(newDirs)
+        setShowBrowser(false)
+        // Auto-save to settings
+        try {
+            await api.updateSettings({ ebook_dirs: newDirs })
+        } catch (e) {
+            console.error('Failed to save settings:', e)
+        }
+    }
 
     const startIngest = async () => {
         setLoading(true)
         try {
             const directories = dirs.split(',').map(d => d.trim()).filter(Boolean)
-            const res = await api.triggerIngest(directories.length ? directories : undefined)
+            const res = await api.triggerIngest({
+                directories: directories.length ? directories : undefined,
+                force_rescan: forceRescan
+            })
             setStatus(res)
 
             // Poll for updates
@@ -95,13 +154,38 @@ export default function IngestPage() {
                         <div className="label-text">Directories</div>
                         <div className="label-desc">Comma-separated paths to scan. Leave empty to use configured directories.</div>
                     </div>
-                    <div className="setting-control">
+                    <div className="setting-control" style={{ display: 'flex', gap: '8px' }}>
                         <input
                             type="text"
                             value={dirs}
                             onChange={e => setDirs(e.target.value)}
                             placeholder="e.g., /path/to/ebooks, /another/path"
                             disabled={status?.is_running}
+                            style={{ flex: 1 }}
+                        />
+                        <button 
+                            className="btn btn-secondary" 
+                            onClick={handleBrowse}
+                            disabled={status?.is_running}
+                            title="Browse folders on the server"
+                        >
+                            <FiFolder /> Browse...
+                        </button>
+                    </div>
+                </div>
+
+                <div className="setting-row" style={{ border: 'none', marginTop: '8px' }}>
+                    <div className="setting-label">
+                        <div className="label-text">Force Rescan</div>
+                        <div className="label-desc">Re-process books even if they already exist in library (useful for full OCR update).</div>
+                    </div>
+                    <div className="setting-control" style={{ display: 'flex', alignItems: 'center' }}>
+                        <input
+                            type="checkbox"
+                            checked={forceRescan}
+                            onChange={e => setForceRescan(e.target.checked)}
+                            disabled={status?.is_running}
+                            style={{ width: 'auto', height: 'auto', cursor: 'pointer' }}
                         />
                     </div>
                 </div>
@@ -154,6 +238,14 @@ export default function IngestPage() {
                     </div>
                 )}
             </div>
+
+            {showBrowser && (
+                <FileBrowser 
+                    onSelect={onBrowserSelect} 
+                    onClose={() => setShowBrowser(false)} 
+                    initialPath={dirs.split(',')[0]?.trim()}
+                />
+            )}
 
             {toast && (
                 <div className={`toast toast-${toast.type}`}>{toast.msg}</div>

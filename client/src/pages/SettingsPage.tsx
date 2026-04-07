@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { api, Settings, getBackendUrl, setBackendUrl, checkBackendHealth, isTauri } from '../api'
-import { FiCheck, FiX, FiRefreshCw } from 'react-icons/fi'
+import { FiCheck, FiX, FiRefreshCw, FiFolder } from 'react-icons/fi'
+import FileBrowser from '../components/FileBrowser'
 
 export default function SettingsPage() {
     const [settings, setSettings] = useState<Settings | null>(null)
@@ -18,6 +19,7 @@ export default function SettingsPage() {
     const [ocrEnabled, setOcrEnabled] = useState(true)
     const [ocrLang, setOcrLang] = useState('eng+chi_sim')
     const [maxWorkers, setMaxWorkers] = useState(4)
+    const [showBrowser, setShowBrowser] = useState(false)
 
     const checkConnection = async () => {
         setChecking(true)
@@ -77,6 +79,34 @@ export default function SettingsPage() {
     const showToast = (type: string, msg: string) => {
         setToast({ type, msg })
         setTimeout(() => setToast(null), 4000)
+    }
+
+    const handleBrowse = async () => {
+        if (isTauri()) {
+            try {
+                const { open } = await import('@tauri-apps/plugin-dialog')
+                const selected = await open({
+                    directory: true,
+                    multiple: true,
+                    defaultPath: ebookDirs.split(',')[0]?.trim() || undefined
+                })
+                if (selected) {
+                    const newPath = Array.isArray(selected) ? selected.join(', ') : (selected as string)
+                    setEbookDirs(newPath)
+                }
+            } catch (e) {
+                console.error('Tauri dialog error:', e)
+                setShowBrowser(true)
+            }
+        } else {
+            setShowBrowser(true)
+        }
+    }
+
+    const onBrowserSelect = (path: string) => {
+        const newDirs = ebookDirs ? `${ebookDirs}, ${path}` : path
+        setEbookDirs(newDirs)
+        setShowBrowser(false)
     }
 
     return (
@@ -140,13 +170,17 @@ export default function SettingsPage() {
                                 <div className="label-text">Scan Directories</div>
                                 <div className="label-desc">Comma-separated paths to scan for ebooks</div>
                             </div>
-                            <div className="setting-control">
+                            <div className="setting-control" style={{ display: 'flex', gap: '8px' }}>
                                 <input
                                     type="text"
                                     value={ebookDirs}
                                     onChange={e => setEbookDirs(e.target.value)}
                                     placeholder="e.g., /volume1/ebooks, /data/books"
+                                    style={{ flex: 1 }}
                                 />
+                                <button className="btn btn-secondary" onClick={handleBrowse}>
+                                    <FiFolder /> Browse...
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -247,6 +281,14 @@ export default function SettingsPage() {
                         Retry Connection
                     </button>
                 </div>
+            )}
+
+            {showBrowser && (
+                <FileBrowser 
+                    onSelect={onBrowserSelect} 
+                    onClose={() => setShowBrowser(false)} 
+                    initialPath={ebookDirs.split(',')[0]?.trim()}
+                />
             )}
 
             {toast && (

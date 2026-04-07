@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import threading
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -22,9 +23,11 @@ class VectorStore:
     brute-force O(n) cost of IndexFlatIP.
     """
 
+    _shared_model = None
+    _model_load_failed = False
+    _load_lock = threading.Lock()
+
     def __init__(self):
-        self._model = None
-        self._model_load_failed = False
         self._index = None
         self._id_map: dict = {}      # vector_idx -> book_id
         self._next_id: int = 0
@@ -34,19 +37,21 @@ class VectorStore:
 
     def _get_model(self):
         """Lazy-load the sentence-transformer model."""
-        if self._model_load_failed:
+        if VectorStore._model_load_failed:
             return None
-        if self._model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-                logger.info("Loading embedding model: %s", settings.embedding_model)
-                self._model = SentenceTransformer(settings.embedding_model)
-                logger.info("Model loaded successfully")
-            except Exception as e:
-                logger.warning("Failed to load embedding model (disabling vector search): %s", e)
-                self._model_load_failed = True
-                return None
-        return self._model
+        if VectorStore._shared_model is None:
+            with VectorStore._load_lock:
+                if VectorStore._shared_model is None:
+                    try:
+                        from sentence_transformers import SentenceTransformer
+                        logger.info("Loading embedding model: %s", settings.embedding_model)
+                        VectorStore._shared_model = SentenceTransformer(settings.embedding_model)
+                        logger.info("Model loaded successfully")
+                    except Exception as e:
+                        logger.warning("Failed to load embedding model (disabling vector search): %s", e)
+                        VectorStore._model_load_failed = True
+                        return None
+        return VectorStore._shared_model
 
     def _get_index(self):
         """Get or create the FAISS index (HNSW for fast ANN search)."""

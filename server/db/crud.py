@@ -58,7 +58,10 @@ async def fts_search(
         params["format"] = format
 
     sql = text(f"""
-        SELECT b.id, bm25(books_fts) AS score
+        SELECT 
+            b.id, 
+            bm25(books_fts) AS score,
+            snippet(books_fts, 5, '<b>', '</b>', '...', 64) AS context
         FROM books_fts
         JOIN books b ON b.id = books_fts.rowid
         WHERE books_fts MATCH :fts_query {filters}
@@ -74,11 +77,35 @@ async def fts_search(
         return []
 
     if not rows:
-        return []
+        # FTS5 failed to match anything (common for CJK text with standard tokenizers).
+        # Fall back to ILIKE search directly within fts_search.
+        like_pattern = f"%{query}%"
+        filename_pattern = f"%{Path(query).stem}%"
+        search_filter = or_(
+            Book.title.ilike(like_pattern),
+            Book.author.ilike(like_pattern),
+            Book.description.ilike(like_pattern),
+            Book.text_content.ilike(like_pattern),
+            Book.file_path.ilike(filename_pattern),
+        )
+        
+        q = select(Book).options(defer(Book.text_content)).where(search_filter)
+        if category:
+            q = q.where(Book.category == category)
+        if format:
+            q = q.where(Book.format == format)
+        
+        q = q.limit(limit)
+        result = await session.execute(q)
+        books = list(result.scalars().all())
+        
+        # Return a simulated BM25 score (negative) for fallback
+        return [(book, -0.5) for book in books]
 
     # Fetch full Book objects for the matched IDs
     book_ids = [row[0] for row in rows]
     score_map = {row[0]: row[1] for row in rows}
+    snippet_map = {row[0]: row[2] for row in rows}
 
     books_result = await session.execute(
         select(Book).options(defer(Book.text_content)).where(Book.id.in_(book_ids))
@@ -87,7 +114,7 @@ async def fts_search(
 
     # Return in relevance order (BM25 ascending = more relevant first)
     return [
-        (books_by_id[bid], score_map[bid])
+        (books_by_id[bid], score_map[bid], snippet_map[bid])
         for bid in book_ids
         if bid in books_by_id
     ]
@@ -148,7 +175,7 @@ async def get_books(
         count_query = count_query.where(Book.format == format)
 
     if search_query:
-        # Try FTS5 first — fast and searches filename too
+        # Try FTS5 first (which now automatically falls back to ILIKE if needed)
         fts_results = await fts_search(
             session, search_query, limit=skip + limit,
             category=category, format=format
@@ -157,19 +184,9 @@ async def get_books(
             books = [b for b, _ in fts_results]
             total = len(fts_results)
             return books[skip:skip + limit], total
-
-        # FTS5 returned nothing — fall back to ILIKE for backward compat
-        like_pattern = f"%{search_query}%"
-        filename_pattern = f"%{Path(search_query).stem}%"
-        search_filter = or_(
-            Book.title.ilike(like_pattern),
-            Book.author.ilike(like_pattern),
-            Book.description.ilike(like_pattern),
-            Book.file_path.ilike(filename_pattern),
-        )
-        query = query.where(search_filter)
-        count_query = count_query.where(search_filter)
-
+        else:
+            return [], 0
+            
     # Sort
     sort_column = getattr(Book, sort_by, Book.created_at)
     if sort_order == "asc":
@@ -268,3 +285,46 @@ async def get_stats(session: AsyncSession) -> dict:
         "category_count": category_count,
         "total_size_bytes": total_size,
     }
+
+
+# ─── Annotation CRUD ────────────────────────────────────────────
+
+from db.models import Annotation
+
+async def get_annotations_for_book(session: AsyncSession, book_id: int) -> List[Annotation]:
+    """Get all annotations for a specific book."""
+    result = await session.execute(
+        select(Annotation)
+        .where(Annotation.book_id == book_id)
+        .order_by(Annotation.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+async def create_annotation(session: AsyncSession, book_id: int, **kwargs) -> Annotation:
+    """Create a new annotation for a book."""
+    annotation = Annotation(book_id=book_id, **kwargs)
+    session.add(annotation)
+    await session.commit()
+    await session.refresh(annotation)
+    return annotation
+
+async def update_annotation(session: AsyncSession, annotation_id: int, **kwargs) -> Optional[Annotation]:
+    """Update an existing annotation."""
+    result = await session.execute(select(Annotation).where(Annotation.id == annotation_id))
+    annotation = result.scalar_one_or_none()
+    if not annotation:
+        return None
+        
+    for key, value in kwargs.items():
+        if hasattr(annotation, key) and value is not None:
+            setattr(annotation, key, value)
+            
+    await session.commit()
+    await session.refresh(annotation)
+    return annotation
+
+async def delete_annotation(session: AsyncSession, annotation_id: int) -> bool:
+    """Delete an annotation by ID."""
+    result = await session.execute(delete(Annotation).where(Annotation.id == annotation_id))
+    await session.commit()
+    return result.rowcount > 0

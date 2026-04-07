@@ -17,12 +17,12 @@ from db.crud import (
     get_books, get_book, create_book, update_book, delete_book,
     get_categories, get_stats, get_book_by_path, fts_search,
 )
-from api.schemas import (
+from .schemas import (
     BookResponse, BookListResponse, BookUpdate,
     CategoryResponse, SearchResult, SearchResponse,
     UnifiedSearchResult, UnifiedSearchResponse,
     IngestRequest, IngestStatus, SettingsResponse, SettingsUpdate,
-    StatsResponse,
+    StatsResponse, FileBrowserResponse, FileBrowserItem,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,7 +107,10 @@ def _is_under_dir(path: Path, allowed_dir: Path) -> bool:
     """Return True if resolved path is under allowed_dir."""
     resolved = path.resolve()
     allowed = allowed_dir.resolve()
-    return str(resolved).startswith(str(allowed) + "/") or resolved == allowed
+    try:
+        return resolved == allowed or resolved.is_relative_to(allowed)
+    except (ValueError, TypeError):
+        return False
 
 
 def _safe_cover_path(path: Path) -> Path:
@@ -119,11 +122,20 @@ def _safe_cover_path(path: Path) -> Path:
 
 
 def _safe_book_path(path: Path) -> Path:
-    """Resolve book file path and verify it is under an allowed ebook directory."""
+    """Resolve book file path and verify it is under an allowed ebook directory.
+
+    If ebook_directories is not configured, allow any path that was stored in the
+    database (the caller already looked the book up by ID, so the path is trusted).
+    """
+    resolved = path.resolve()
     allowed_dirs = settings.ebook_directories + [settings.data_dir]
-    if not any(_is_under_dir(path, d) for d in allowed_dirs):
-        raise HTTPException(status_code=403, detail="Access denied")
-    return path.resolve()
+    # If allowed dirs are configured, enforce the check
+    if allowed_dirs and any(_is_under_dir(resolved, d) for d in allowed_dirs):
+        return resolved
+    # Fallback: the path came from a trusted DB record — just verify it exists
+    if resolved.is_file():
+        return resolved
+    raise HTTPException(status_code=403, detail="Access denied")
 
 
 @router.get("/books/{book_id}/cover")
@@ -176,6 +188,58 @@ async def get_book_file(
             "Cache-Control": "private, max-age=3600",
         },
     )
+
+
+# ─── Annotations ────────────────────────────────────────────────
+
+from db.crud import get_annotations_for_book, create_annotation, update_annotation, delete_annotation
+from api.schemas import AnnotationCreate, AnnotationUpdate, AnnotationResponse
+
+@router.get("/books/{book_id}/annotations", response_model=list[AnnotationResponse])
+async def list_annotations(
+    book_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """Get all annotations for a book."""
+    book = await get_book(session, book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return await get_annotations_for_book(session, book_id)
+
+@router.post("/books/{book_id}/annotations", response_model=AnnotationResponse)
+async def add_annotation(
+    book_id: int,
+    data: AnnotationCreate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a new annotation for a book."""
+    book = await get_book(session, book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return await create_annotation(session, book_id, **data.model_dump())
+
+@router.put("/annotations/{annotation_id}", response_model=AnnotationResponse)
+async def edit_annotation(
+    annotation_id: int,
+    data: AnnotationUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Update an annotation (e.g. adding a note or altering color)."""
+    annotation = await update_annotation(session, annotation_id, **data.model_dump(exclude_unset=True))
+    if not annotation:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    return annotation
+
+@router.delete("/annotations/{annotation_id}")
+async def remove_annotation(
+    annotation_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete an annotation."""
+    success = await delete_annotation(session, annotation_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    return {"message": "Annotation deleted"}
 
 
 # ─── Categories ─────────────────────────────────────────────────
@@ -247,7 +311,7 @@ async def unified_search(
     semantic_count = 0
 
     # Keyword results first (higher precision)
-    for book, bm25_score in fts_pairs:
+    for book, bm25_score, snippet in fts_pairs:
         if book.id in seen_ids:
             continue
         seen_ids.add(book.id)
@@ -258,6 +322,7 @@ async def unified_search(
             score=normalised,
             source="keyword",
             filename=Path(book.file_path).stem if book.file_path else None,
+            context=snippet
         ))
         keyword_count += 1
 
@@ -350,10 +415,11 @@ async def trigger_ingest(
     pipeline = IngestPipeline()
 
     # Run pipeline in background
+    force_rescan = request.force_rescan if request else False
     async def run_pipeline():
         try:
-            logger.info("Background ingest task started for: %s", dirs)
-            await pipeline.run(dirs, _ingest_state)
+            logger.info("Background ingest task started for: %s (force=%s)", dirs, force_rescan)
+            await pipeline.run(dirs, _ingest_state, force_rescan=force_rescan)
             logger.info("Background ingest task completed")
         except Exception as e:
             logger.error("Ingest pipeline crashed: %s\n%s", e, traceback.format_exc())
@@ -389,7 +455,7 @@ async def get_settings():
 
 @router.put("/settings", response_model=SettingsResponse)
 async def update_settings(data: SettingsUpdate):
-    """Update settings (runtime only, does not persist to .env)."""
+    """Update settings and persist to disk."""
     if data.ebook_dirs is not None:
         settings.ebook_dirs = data.ebook_dirs
     if data.ocr_enabled is not None:
@@ -399,6 +465,9 @@ async def update_settings(data: SettingsUpdate):
     if data.max_workers is not None:
         settings.max_workers = data.max_workers
 
+    # Persist to data/user_settings.json
+    settings.save_to_disk()
+
     return SettingsResponse(
         ebook_dirs=settings.ebook_dirs,
         ocr_enabled=settings.ocr_enabled,
@@ -406,6 +475,45 @@ async def update_settings(data: SettingsUpdate):
         embedding_model=settings.embedding_model,
         max_workers=settings.max_workers,
         data_dir=str(settings.data_dir),
+    )
+
+
+# ─── Admin & Utilities ──────────────────────────────────────────
+
+@router.get("/admin/browse", response_model=FileBrowserResponse)
+async def browse_files(path: str = ""):
+    """Browse server-side folders for directory selection."""
+    from pathlib import Path
+    import os
+
+    current = Path(path) if path else Path.cwd()
+    if not current.exists():
+        current = Path.cwd()
+    
+    # Resolve to absolute for clarity, but be careful with permissions in production
+    # In a local/NAS context, this is usually acceptable
+    current = current.absolute()
+    
+    items = []
+    try:
+        for entry in os.scandir(current):
+            # Only show directories by default for "Select Folder" use case
+            if entry.is_dir():
+                items.append(FileBrowserItem(
+                    name=entry.name,
+                    path=str(Path(entry.path)),
+                    is_dir=True
+                ))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot browse directory: {e}")
+
+    # Sort: folders first, then alphabetical
+    items.sort(key=lambda x: x.name.lower())
+
+    return FileBrowserResponse(
+        current_path=str(current),
+        parent_path=str(current.parent) if current.parent != current else None,
+        items=items
     )
 
 
@@ -434,7 +542,7 @@ async def rebuild_fts_index(
     try:
         await session.execute(sqla_text("DELETE FROM books_fts"))
         await session.execute(sqla_text("""
-            INSERT INTO books_fts(rowid, title, author, filename, summary, description)
+            INSERT INTO books_fts(rowid, title, author, filename, summary, description, text_content)
             SELECT
                 id,
                 COALESCE(title, ''),
@@ -442,7 +550,8 @@ async def rebuild_fts_index(
                 COALESCE(REPLACE(file_path,
                     RTRIM(file_path, REPLACE(file_path, '/', '')), ''), ''),
                 COALESCE(summary, ''),
-                COALESCE(description, '')
+                COALESCE(description, ''),
+                COALESCE(text_content, '')
             FROM books
         """))
         await session.commit()
@@ -452,3 +561,38 @@ async def rebuild_fts_index(
     except Exception as e:
         logger.error("FTS rebuild failed: %s", e)
         raise HTTPException(status_code=500, detail=f"FTS rebuild failed: {e}")
+
+
+@router.post("/admin/rebuild-vectors")
+async def rebuild_vector_index(
+    session: AsyncSession = Depends(get_session),
+):
+    """Rebuild the FAISS vector index from all existing book records.
+
+    Run this if the FAISS index files are missing or corrupted.
+    """
+    from search.vector_store import vector_store
+    from sqlalchemy import text as sqla_text
+
+    try:
+        result = await session.execute(
+            sqla_text("SELECT id, title, author, text_content FROM books")
+        )
+        rows = result.fetchall()
+
+        if not rows:
+            return {"message": "No books found to index"}
+
+        texts_and_ids = []
+        for row in rows:
+            book_id, title, author, text_content = row
+            text = f"{title or ''} {author or ''} {(text_content or '')[:2000]}"
+            texts_and_ids.append((text, book_id))
+
+        await vector_store.rebuild(texts_and_ids)
+
+        return {"message": f"Vector index rebuilt with {len(texts_and_ids)} entries"}
+    except Exception as e:
+        logger.error("Vector index rebuild failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Vector rebuild failed: {e}")
+

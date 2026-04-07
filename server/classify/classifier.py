@@ -2,6 +2,7 @@
 
 import logging
 import re
+import threading
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ class Classifier:
 
     _shared_model = None  # Class-level shared model
     _model_load_failed = False  # Don't retry if loading failed
+    _load_lock = threading.Lock() # Thread-safe lock for loading
 
     def _rule_classify(self, text: str) -> Optional[Dict[str, str]]:
         """Try to classify using keyword rules."""
@@ -116,11 +118,14 @@ class Classifier:
 
         try:
             if Classifier._shared_model is None:
-                from sentence_transformers import SentenceTransformer
-                from config import settings
-                logger.info("Loading embedding model for classification...")
-                Classifier._shared_model = SentenceTransformer(settings.embedding_model)
-                logger.info("Classification model loaded successfully")
+                with Classifier._load_lock:
+                    # Double-check inside lock
+                    if Classifier._shared_model is None:
+                        from sentence_transformers import SentenceTransformer
+                        from config import settings
+                        logger.info("Loading embedding model for classification...")
+                        Classifier._shared_model = SentenceTransformer(settings.embedding_model)
+                        logger.info("Classification model loaded successfully")
 
             from sentence_transformers import util
 

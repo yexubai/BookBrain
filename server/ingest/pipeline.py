@@ -138,11 +138,21 @@ class IngestPipeline:
                 for result in batch:
                     if result["success"]:
                         try:
-                            book = await create_book(session, **result["data"])
+                            # Handle force_rescan / duplicates
+                            existing = await get_book_by_path(session, result["data"]["file_path"])
+                            if existing:
+                                # Update existing book
+                                from db.crud import update_book
+                                data = result["data"]
+                                book = await update_book(session, existing.id, **data)
+                            else:
+                                # Create new book
+                                book = await create_book(session, **result["data"])
+                            
                             books_to_embed.append(book)
                             saved += 1
                         except Exception as e:
-                            logger.error("Failed to create book record: %s", e)
+                            logger.error("Failed to store book record: %s", e)
                             failed += 1
                     else:
                         failed += 1
@@ -183,10 +193,9 @@ class IngestPipeline:
         except Exception as e:
             logger.warning("Batch vector indexing failed: %s", e)
 
-    async def run(self, directories: List[Path], status: dict = None) -> None:
+    async def run(self, directories: List[Path], status: dict = None, force_rescan: bool = False) -> None:
         """Run the full ingest pipeline with parallel file processing."""
         loop = asyncio.get_running_loop()
-        semaphore = asyncio.Semaphore(_CONCURRENCY)
         counter_lock = asyncio.Lock()
         batch: list = []
         batch_lock = asyncio.Lock()
@@ -204,63 +213,77 @@ class IngestPipeline:
 
         processed_count = 0
         failed_count = 0
+        
+        # Memory-efficient task processing using a queue
+        queue: asyncio.Queue = asyncio.Queue(maxsize=settings.max_workers * 2)
 
-        async def process_one(file_path: Path) -> None:
+        async def worker():
             nonlocal processed_count, failed_count, batch
-
-            # Skip already-processed files
-            try:
-                async with async_session() as session:
-                    existing = await get_book_by_path(session, str(file_path))
-                    if existing:
-                        logger.debug("Skipping already processed: %s", file_path.name)
-                        async with counter_lock:
-                            processed_count += 1
-                            if status is not None:
-                                status["processed_files"] = processed_count
-                                status["progress_percent"] = (processed_count + failed_count) / total * 100
-                        return
-            except Exception as e:
-                logger.error("DB check failed for %s: %s", file_path.name, e)
-
-            if status is not None:
-                status["current_file"] = file_path.name
-
-            async with semaphore:
+            while True:
+                file_path = await queue.get()
+                if file_path is None:
+                    queue.task_done()
+                    break
+                
                 try:
+                    # 1. Skip already-processed files unless force_rescan is True
+                    async with async_session() as session:
+                        existing = await get_book_by_path(session, str(file_path))
+                        if existing and not force_rescan:
+                            async with counter_lock:
+                                processed_count += 1
+                                if status is not None:
+                                    status["processed_files"] = processed_count
+                                    status["progress_percent"] = (processed_count + failed_count) / total * 100
+                            queue.task_done()
+                            continue
+                    
+                    if status is not None:
+                        status["current_file"] = file_path.name
+                    
+                    # 2. Process file in thread pool
                     result = await loop.run_in_executor(
                         self.executor, self._process_single_file, file_path
                     )
+                    
+                    # 3. Accumulate into batch
+                    flush_now = False
+                    async with batch_lock:
+                        batch.append(result)
+                        if len(batch) >= settings.db_batch_size:
+                            current_batch, batch = batch, []
+                            flush_now = True
+                    
+                    if flush_now:
+                        saved, failed = await self._flush_batch(current_batch)
+                        async with counter_lock:
+                            processed_count += saved
+                            failed_count += failed
                 except Exception as e:
-                    logger.error("Thread pool error for %s: %s", file_path.name, e)
-                    result = {"success": False, "file_path": str(file_path), "error": str(e)}
-
-            # Accumulate into batch
-            flush_now = False
-            async with batch_lock:
-                batch.append(result)
-                if len(batch) >= settings.db_batch_size:
-                    current_batch, batch = batch, []
-                    flush_now = True
-
-            if flush_now:
-                saved, failed = await self._flush_batch(current_batch)
-                async with counter_lock:
-                    processed_count += saved
-                    failed_count += failed
+                    logger.error("Worker error for %s: %s", file_path.name, e)
+                    async with counter_lock:
+                        failed_count += 1
+                        if status is not None:
+                            status["errors"].append(f"{file_path}: {e}")
+                finally:
                     if status is not None:
                         status["processed_files"] = processed_count
                         status["failed_files"] = failed_count
                         status["progress_percent"] = (processed_count + failed_count) / total * 100
-                        if result.get("error"):
-                            status["errors"].append(f"{result['file_path']}: {result['error']}")
-            else:
-                if not result["success"] and status is not None:
-                    status["errors"].append(f"{result['file_path']}: {result['error']}")
+                    queue.task_done()
 
-        # Launch all tasks; semaphore limits actual concurrency
-        tasks = [process_one(fp) for fp in self.scanner.scan_iter(directories)]
-        await asyncio.gather(*tasks)
+        # Start workers
+        worker_tasks = [asyncio.create_task(worker()) for _ in range(settings.max_workers)]
+
+        # Stream files into queue
+        for fp in self.scanner.scan_iter(directories):
+            await queue.put(fp)
+            
+        # Signal workers to exit
+        for _ in range(settings.max_workers):
+            await queue.put(None)
+            
+        await asyncio.gather(*worker_tasks)
 
         # Flush remaining batch
         async with batch_lock:
@@ -269,6 +292,13 @@ class IngestPipeline:
             saved, failed = await self._flush_batch(remaining)
             processed_count += saved
             failed_count += failed
+
+        # Persist FAISS index to disk so it survives server restarts
+        try:
+            from search.vector_store import vector_store
+            await vector_store.save()
+        except Exception as e:
+            logger.warning("Failed to save vector index: %s", e)
 
         if status is not None:
             status["progress_percent"] = 100.0

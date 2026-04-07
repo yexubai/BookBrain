@@ -27,6 +27,12 @@ logger = logging.getLogger("bookbrain")
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     # Startup
+    settings.load_from_disk()
+    
+    # Update logging level if debug was toggled in settings
+    if settings.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
     logger.info("Starting BookBrain v%s", settings.app_version)
     settings.ensure_directories()
     await init_db()

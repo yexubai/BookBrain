@@ -76,3 +76,32 @@ class Book(Base):
 
     def __repr__(self) -> str:
         return f"<Book(id={self.id}, title='{self.title}', author='{self.author}')>"
+
+
+class Annotation(Base):
+    """Book highlights and notes."""
+
+    __tablename__ = "annotations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    book_id = Column(Integer, ForeignKey("books.id", ondelete="CASCADE"), nullable=False, index=True)
+    
+    # Generic location string, interpreted by the frontend (CFI for EPUB, Page/Rect for PDF)
+    location = Column(String(1000), nullable=False)
+    
+    # The actual highlighted text
+    selected_text = Column(Text, nullable=False)
+    
+    # Optional note attached to the highlight
+    note = Column(Text, default="")
+    
+    # Highlight color (hex or named, e.g., 'yellow', '#ffeb3b')
+    color = Column(String(20), default="yellow")
+    
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    book = relationship("Book", backref="annotations")
+    
+    def __repr__(self) -> str:
+        return f"<Annotation(id={self.id}, book_id={self.book_id})>"
