@@ -1,4 +1,12 @@
-"""BookBrain configuration management."""
+"""BookBrain configuration management.
+
+Centralises all application settings using pydantic-settings.  Values are
+resolved in this order (highest priority first):
+  1. Environment variables with the ``BOOKBRAIN_`` prefix
+  2. A ``.env`` file in the working directory
+  3. Persisted user settings in ``data/user_settings.json``
+  4. Hardcoded defaults below
+"""
 
 import os
 from pathlib import Path
@@ -9,71 +17,83 @@ from pydantic import Field
 
 
 class Settings(BaseSettings):
-    """Application settings with environment variable support."""
+    """Application settings with environment variable support.
 
-    # Application
+    All fields can be overridden via ``BOOKBRAIN_<FIELD>`` env vars.
+    """
+
+    # ── Application identity ───────────────────────────────────
     app_name: str = "BookBrain"
     app_version: str = "0.1.0"
-    debug: bool = False
+    debug: bool = False  # Enables verbose logging and SQL echo
 
-    # Server
+    # ── Server binding ─────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Database
+    # ── Database ───────────────────────────────────────────────
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/bookbrain.db",
-        description="SQLAlchemy database URL"
+        description="SQLAlchemy async database URL",
     )
 
-    # Ebook Directories (comma-separated paths)
+    # ── Ebook directories ──────────────────────────────────────
+    # Comma-separated list of absolute paths to scan for ebooks.
     ebook_dirs: str = Field(
         default="",
-        description="Comma-separated list of directories to scan for ebooks"
+        description="Comma-separated list of directories to scan for ebooks",
     )
 
-    # File Storage
-    data_dir: Path = Field(default=Path("./data"), description="Data directory")
-    covers_dir: Path = Field(default=Path("./data/covers"), description="Cover images directory")
-    index_dir: Path = Field(default=Path("./data/index"), description="FAISS index directory")
+    # ── File storage paths ─────────────────────────────────────
+    data_dir: Path = Field(default=Path("./data"), description="Root data directory")
+    covers_dir: Path = Field(default=Path("./data/covers"), description="Extracted cover images")
+    index_dir: Path = Field(default=Path("./data/index"), description="FAISS index files")
 
-    # OCR
+    # ── OCR settings ───────────────────────────────────────────
     ocr_enabled: bool = True
-    ocr_language: str = "ch_sim+en"  # EasyOCR language codes
-    ocr_max_pages: int = 20
-    scanned_text_threshold: float = 0.1  # Below this ratio, consider PDF as scanned
+    ocr_language: str = "ch_sim+en"  # EasyOCR language codes ('+' separated)
+    ocr_max_pages: int = 20  # Max pages to OCR per PDF (performance guard)
+    scanned_text_threshold: float = 0.1  # Chars-per-page ratio below which a PDF is deemed scanned
 
-    # ML Model
-    embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
-    embedding_dimension: int = 384
+    # ── ML / Embedding model ───────────────────────────────────
+    embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"  # sentence-transformers model name
+    embedding_dimension: int = 384  # Must match the chosen model's output dimension
 
-    # Processing
+    # ── Processing tuning ──────────────────────────────────────
     max_workers: int = Field(
-        default=max(1, (os.cpu_count() or 4) // 2), 
-        description="Max threads for processing (half of logical cores)"
+        default=max(1, (os.cpu_count() or 4) // 2),
+        description="Concurrent processing threads (defaults to half of logical CPU cores)",
     )
-    max_text_length: int = 2000000  # Max chars of text to store per book (full-text search)
-    batch_size: int = 32          # Batch size for embedding
-    db_batch_size: int = 50       # Books to accumulate before a batch DB commit
+    max_text_length: int = 2000000  # Max characters of text to store per book
+    batch_size: int = 32            # Number of texts per embedding batch
+    db_batch_size: int = 50         # Books to accumulate before flushing to DB
 
-    # Supported formats
+    # ── Supported ebook formats ────────────────────────────────
     supported_formats: List[str] = [".pdf", ".epub", ".mobi", ".azw3", ".txt", ".cbz", ".html"]
 
+    # pydantic-settings configuration: read BOOKBRAIN_* env vars and .env file
     model_config = {
         "env_prefix": "BOOKBRAIN_",
         "env_file": ".env",
         "env_file_encoding": "utf-8",
     }
 
+    # ── Derived properties ─────────────────────────────────────
+
     @property
     def ebook_directories(self) -> List[Path]:
-        """Parse comma-separated ebook directories."""
+        """Parse the comma-separated ``ebook_dirs`` string into a list of Paths."""
         if not self.ebook_dirs:
             return []
         return [Path(d.strip()) for d in self.ebook_dirs.split(",") if d.strip()]
 
+    # ── Persistence helpers ────────────────────────────────────
+
     def save_to_disk(self) -> None:
-        """Save settings to a JSON file."""
+        """Persist user-modifiable settings to ``data/user_settings.json``.
+
+        Only a subset of settings (those editable via the Web UI) are saved.
+        """
         import json
         settings_path = self.data_dir / "user_settings.json"
         data = {
@@ -88,12 +108,16 @@ class Settings(BaseSettings):
             json.dump(data, f, indent=4, ensure_ascii=False)
 
     def load_from_disk(self) -> None:
-        """Load settings from a JSON file if it exists."""
+        """Load persisted settings from ``data/user_settings.json`` if present.
+
+        Called once during application startup (before routes are served).
+        Silently skips if the file doesn't exist or is corrupt.
+        """
         self.ensure_directories()
         settings_path = self.data_dir / "user_settings.json"
         if not settings_path.exists():
             return
-        
+
         import json
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
@@ -102,15 +126,15 @@ class Settings(BaseSettings):
                     if hasattr(self, key):
                         setattr(self, key, value)
         except Exception as e:
-            # We don't have a logger initialized yet in config.py easily, but it's safe to print here
+            # Logger may not be initialised yet at this point
             print(f"Warning: Could not load user settings: {e}")
 
     def ensure_directories(self) -> None:
-        """Create required directories."""
+        """Create required data directories if they don't exist."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.covers_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
 
 
-# Global settings instance
+# Singleton settings instance used throughout the application
 settings = Settings()

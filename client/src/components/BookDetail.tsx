@@ -1,3 +1,13 @@
+/**
+ * BookDetail — Modal overlay showing full book metadata.
+ *
+ * Displays cover image, title, author, format, category, publisher,
+ * year, ISBN, language, file size, page count, OCR status, and summary.
+ *
+ * The "Read" button navigates to the ReaderPage, optionally jumping to
+ * a specific page number or location tag (from search results).
+ */
+
 import { useNavigate } from 'react-router-dom'
 import { api, Book } from '../api'
 import { FiX, FiBookOpen } from 'react-icons/fi'
@@ -5,20 +15,28 @@ import { FiX, FiBookOpen } from 'react-icons/fi'
 interface BookDetailProps {
     book: Book
     onClose: () => void
+    pageNumber?: number    // Optional page to jump to (from search results)
+    locationTag?: string   // Optional EPUB CFI or PDF page tag (from search results)
 }
 
+/** Format file size in bytes to human-readable string. */
 function formatSize(bytes: number): string {
     if (bytes < 1024) return bytes + ' B'
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
 }
 
-export default function BookDetail({ book, onClose }: BookDetailProps) {
+export default function BookDetail({ book, onClose, pageNumber, locationTag }: BookDetailProps) {
     const navigate = useNavigate()
 
+    /** Close the modal and navigate to the reader with optional jump-to location. */
     const openReader = () => {
+        console.log('BookDetail: Opening reader for book:', book.id, 'page:', pageNumber, 'location:', locationTag)
         onClose()
-        navigate(`/reader?id=${book.id}`)
+        let url = `/reader?id=${book.id}`
+        if (pageNumber) url += `&page=${pageNumber}`
+        if (locationTag) url += `&location=${encodeURIComponent(locationTag)}`
+        navigate(url)
     }
 
     return (
@@ -41,7 +59,7 @@ export default function BookDetail({ book, onClose }: BookDetailProps) {
                         )}
                         <button className="btn btn-primary read-btn" onClick={openReader}>
                             <FiBookOpen style={{ marginRight: '6px' }} />
-                            Read
+                            {pageNumber ? `Read from Page ${pageNumber}` : (locationTag ? 'Read from Match' : 'Read')}
                         </button>
                     </div>
                     <div className="modal-details">

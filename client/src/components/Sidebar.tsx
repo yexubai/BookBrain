@@ -1,3 +1,15 @@
+/**
+ * Sidebar — Navigation menu and category tree.
+ *
+ * Top section contains navigation links (All Books, Semantic Search,
+ * Import Books, Settings) with active-state highlighting based on the
+ * current route.
+ *
+ * Bottom section renders a collapsible category tree fetched from
+ * the `/api/categories` endpoint.  Clicking a category filters the
+ * LibraryPage; clicking again clears the filter.
+ */
+
 import { useState, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { api, Category } from '../api'
@@ -13,14 +25,16 @@ interface SidebarProps {
 
 export default function Sidebar({ selectedCategory, onSelectCategory }: SidebarProps) {
     const [categories, setCategories] = useState<Category[]>([])
-    const [expandedCats, setExpandedCats] = useState<Set<string>>(new Set())
+    const [expandedCats, setExpandedCats] = useState<Set<string>>(new Set()) // Tracks which categories are expanded
     const navigate = useNavigate()
     const location = useLocation()
 
+    // Fetch category tree on mount
     useEffect(() => {
         api.getCategories().then(setCategories).catch(() => { })
     }, [])
 
+    /** Toggle expand/collapse for a category with subcategories. */
     const toggleCat = (name: string) => {
         setExpandedCats(prev => {
             const next = new Set(prev)

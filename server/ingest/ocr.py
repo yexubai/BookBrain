@@ -1,4 +1,16 @@
-"""OCR processing for scanned PDF files."""
+"""OCR processing for scanned PDF files.
+
+Uses EasyOCR (deep-learning-based) to extract text from PDF pages that
+were scanned as images.  The OCR engine is lazy-loaded on first use and
+shared across all threads via a class-level singleton to avoid loading
+the model multiple times.
+
+Workflow:
+  1. ``is_scanned_pdf()`` checks whether a PDF has too little embedded text
+     per page (below ``scanned_text_threshold``) to be considered digital.
+  2. ``process_pdf()`` renders each page to a 200 DPI image and runs EasyOCR
+     on it, up to ``ocr_max_pages`` pages.
+"""
 
 import logging
 from pathlib import Path
@@ -11,16 +23,21 @@ logger = logging.getLogger(__name__)
 
 
 class OCRProcessor:
-    """OCR processor using easyocr for standalone scanned PDFs."""
+    """OCR processor using EasyOCR for scanned PDF text extraction.
 
-    _shared_reader = None
-    _load_lock = threading.Lock()
+    The EasyOCR Reader is shared as a class-level singleton (``_shared_reader``)
+    because model loading is expensive (~1-2 seconds + GPU memory).  A threading
+    lock ensures safe initialisation when multiple ingest workers start concurrently.
+    """
+
+    _shared_reader = None      # Shared EasyOCR Reader instance (lazy-loaded)
+    _load_lock = threading.Lock()  # Thread-safe initialisation guard
 
     def __init__(self):
         self.enabled = settings.ocr_enabled
-        self.language = settings.ocr_language
-        self.max_pages = settings.ocr_max_pages
-        self.text_threshold = settings.scanned_text_threshold
+        self.language = settings.ocr_language       # EasyOCR language codes ('+' separated)
+        self.max_pages = settings.ocr_max_pages     # Max pages to OCR per PDF
+        self.text_threshold = settings.scanned_text_threshold  # Chars-per-page ratio threshold
 
     def is_scanned_pdf(self, file_path: Path, text_content: str, page_count: int) -> bool:
         """Detect if a PDF is likely scanned (has very little text).

@@ -1,13 +1,24 @@
+/**
+ * LibraryPage — Main book listing page.
+ *
+ * Displays books in a paginated grid or list view with optional filtering
+ * by category and search query.  The search query is debounced (400ms)
+ * to avoid excessive API calls while the user is typing.
+ *
+ * Clicking a book card opens the BookDetail modal.
+ */
+
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { api, Book, BookListResponse } from '../api'
 import BookDetail from '../components/BookDetail'
 import { FiGrid, FiList, FiBook } from 'react-icons/fi'
 
 interface LibraryPageProps {
-    selectedCategory: string | null
-    searchQuery: string
+    selectedCategory: string | null  // Category filter from Sidebar (null = all)
+    searchQuery: string              // Live search text from Topbar
 }
 
+/** Format file size in bytes to human-readable string (B / KB / MB). */
 function formatSize(bytes: number): string {
     if (bytes < 1024) return bytes + ' B'
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
@@ -17,13 +28,13 @@ function formatSize(bytes: number): string {
 export default function LibraryPage({ selectedCategory, searchQuery }: LibraryPageProps) {
     const [data, setData] = useState<BookListResponse | null>(null)
     const [loading, setLoading] = useState(true)
-    const [view, setView] = useState<'grid' | 'list'>('grid')
+    const [view, setView] = useState<'grid' | 'list'>('grid')  // Toggle between grid and list layout
     const [page, setPage] = useState(1)
-    const [selectedBook, setSelectedBook] = useState<Book | null>(null)
-    // Debounced query — only fires API request 400ms after user stops typing
+    const [selectedBook, setSelectedBook] = useState<Book | null>(null)  // Book for the detail modal
+    // Debounced query — delays API call by 400ms after user stops typing
     const [debouncedQuery, setDebouncedQuery] = useState(searchQuery)
     const pageSize = 20
-    const abortRef = useRef<AbortController | null>(null)
+    const abortRef = useRef<AbortController | null>(null)  // Cancel in-flight requests on re-fetch
 
     useEffect(() => {
         const timer = setTimeout(() => setDebouncedQuery(searchQuery), 400)
@@ -71,7 +82,22 @@ export default function LibraryPage({ selectedCategory, searchQuery }: LibraryPa
         <div style={{ opacity: loading ? 0.6 : 1, transition: 'opacity 0.15s' }}>
             <div className="page-header">
                 <div>
-                    <h2>{selectedCategory || 'All Books'}</h2>
+                    <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {selectedCategory || 'All Books'}
+                        {selectedCategory && (
+                            <button 
+                                className="btn-icon" 
+                                onClick={() => {
+                                    // Triggering a custom event or using a prop to reset
+                                    window.dispatchEvent(new CustomEvent('clear-category'));
+                                }} 
+                                title="Clear filter"
+                                style={{ fontSize: '14px', opacity: 0.6 }}
+                            >
+                                ✕
+                            </button>
+                        )}
+                    </h2>
                     <span className="page-meta">{total} book{total !== 1 ? 's' : ''}</span>
                 </div>
                 <div className="view-toggle">

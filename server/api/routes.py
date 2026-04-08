@@ -1,4 +1,15 @@
-"""REST API routes for BookBrain."""
+"""REST API routes for BookBrain.
+
+All routes are mounted under the ``/api`` prefix.  Route groups:
+  - Books:       CRUD, cover images, file serving
+  - Annotations: highlights and notes per book
+  - Categories:  category tree with counts
+  - Search:      pure semantic and unified (keyword + semantic) search
+  - Ingest:      trigger import pipeline, poll progress
+  - Settings:    read/update application settings
+  - Admin:       file browser, FTS5/FAISS index rebuild
+  - Stats:       library statistics
+"""
 
 import math
 import asyncio
@@ -152,10 +163,20 @@ async def get_book_cover(
     if not cover_path.exists():
         raise HTTPException(status_code=404, detail="Cover file not found")
 
+    suffix = cover_path.suffix.lower()
+    media_type = "image/png" if suffix == ".png" else "image/jpeg"
+
+    # Use file_hash in ETag to bust cache when book-ID-to-cover mapping changes
+    headers = {}
+    if book.file_hash:
+        headers["ETag"] = f'"{book.file_hash}"'
+        headers["Cache-Control"] = "private, max-age=86400"
+
     return FileResponse(
         str(cover_path),
-        media_type="image/jpeg",
-        filename=f"cover_{book_id}.jpg",
+        media_type=media_type,
+        filename=f"cover_{book_id}{suffix}",
+        headers=headers,
     )
 
 
@@ -192,7 +213,7 @@ async def get_book_file(
 
 # ─── Annotations ────────────────────────────────────────────────
 
-from db.crud import get_annotations_for_book, create_annotation, update_annotation, delete_annotation
+from db.crud import get_annotations_for_book, create_annotation, update_annotation, delete_annotation, get_chunk
 from api.schemas import AnnotationCreate, AnnotationUpdate, AnnotationResponse
 
 @router.get("/books/{book_id}/annotations", response_model=list[AnnotationResponse])
@@ -305,16 +326,18 @@ async def unified_search(
     )
     fts_pairs, vec_pairs = await asyncio.gather(fts_task, vec_task)
 
-    seen_ids: set = set()
+    seen_chunks: set = set()
     results: list[UnifiedSearchResult] = []
     keyword_count = 0
     semantic_count = 0
 
     # Keyword results first (higher precision)
-    for book, bm25_score, snippet in fts_pairs:
-        if book.id in seen_ids:
+    for book, chunk, bm25_score, snippet in fts_pairs:
+        chunk_id = chunk.id if chunk else f"k-{book.id}"
+        if chunk_id in seen_chunks:
             continue
-        seen_ids.add(book.id)
+        seen_chunks.add(chunk_id)
+        
         # Normalise BM25 to a 0-1 relevance score (BM25 is negative in SQLite)
         normalised = max(0.0, min(1.0, 1.0 / (1.0 + abs(bm25_score))))
         results.append(UnifiedSearchResult(
@@ -322,23 +345,35 @@ async def unified_search(
             score=normalised,
             source="keyword",
             filename=Path(book.file_path).stem if book.file_path else None,
-            context=snippet
+            context=snippet,
+            page_number=chunk.page_number if chunk else None,
+            location_tag=chunk.location_tag if chunk else None
         ))
         keyword_count += 1
 
-    # Semantic results — only add books not already in keyword results
-    for book_id, vec_score in vec_pairs:
-        if book_id in seen_ids:
+    # Semantic results
+    for chunk_id, vec_score in vec_pairs:
+        if chunk_id in seen_chunks:
             continue
-        book = await get_book(session, book_id)
+            
+        # Resolve chunk to book
+        chunk = await get_chunk(session, chunk_id)
+        if not chunk:
+            continue
+            
+        book = chunk.book
         if not book:
             continue
-        seen_ids.add(book_id)
+            
+        seen_chunks.add(chunk_id)
         results.append(UnifiedSearchResult(
             book=book,
             score=float(vec_score),
             source="semantic",
             filename=Path(book.file_path).stem if book.file_path else None,
+            page_number=chunk.page_number,
+            location_tag=chunk.location_tag,
+            context=chunk.content[:200] + "..." if chunk.content else None
         ))
         semantic_count += 1
 
@@ -356,7 +391,9 @@ async def unified_search(
 
 # ─── Ingest ─────────────────────────────────────────────────────
 
-# Use a plain dict for mutable progress tracking (NOT a Pydantic model)
+# Mutable dict for real-time ingest progress tracking.
+# Shared between the background pipeline task and the status endpoint.
+# A plain dict is used instead of a Pydantic model for in-place mutation.
 _ingest_state: dict = {
     "is_running": False,
     "total_files": 0,

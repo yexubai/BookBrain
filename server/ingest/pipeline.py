@@ -1,4 +1,17 @@
-"""Multi-threaded ingest pipeline for processing ebooks."""
+"""Multi-threaded ingest pipeline for processing ebooks.
+
+Orchestrates the full import workflow:
+  1. Scan directories for ebook files (Scanner)
+  2. Skip files already in the database (unless force_rescan)
+  3. Extract metadata and text in a thread pool (Extractor + OCR)
+  4. Classify each book (rule-based then ML zero-shot)
+  5. Batch-commit books and chunks to the database
+  6. Generate vector embeddings for all chunks (sentence-transformers + FAISS)
+  7. Persist the FAISS index to disk
+
+The pipeline runs asynchronously in the background and reports progress
+through a shared ``status`` dict that the API polls via ``/api/ingest/status``.
+"""
 
 import asyncio
 import logging
@@ -9,15 +22,14 @@ from typing import List, Optional
 
 from config import settings
 from db.database import async_session
-from db.crud import get_book_by_path, create_book
+from db.crud import get_book_by_path, create_book, create_chunks, update_chunk, get_chunks_for_book
 from ingest.scanner import Scanner
 from ingest.extractor import extract_metadata, compute_file_hash
 from ingest.ocr import OCRProcessor
 
 logger = logging.getLogger(__name__)
 
-# How many files to process concurrently
-_CONCURRENCY = settings.max_workers
+_CONCURRENCY = settings.max_workers  # Number of concurrent file-processing workers
 
 
 class IngestPipeline:
@@ -25,6 +37,12 @@ class IngestPipeline:
 
     Scans directories, extracts metadata/text, runs OCR if needed,
     classifies books, generates embeddings, and stores everything.
+
+    Key design decisions:
+      - CPU-bound extraction runs in a ThreadPoolExecutor to avoid blocking the event loop
+      - Books are batched (``db_batch_size``) before DB commit to reduce transaction overhead
+      - Vector embeddings are generated after DB commit to isolate FAISS errors from data storage
+      - An asyncio.Queue with bounded size (workers * 2) provides backpressure
     """
 
     def __init__(self):
@@ -112,6 +130,7 @@ class IngestPipeline:
                     "subcategory": subcategory,
                     "summary": summary,
                     "text_content": metadata.text_content,
+                    "chunks": metadata.chunks,
                     "page_count": metadata.page_count,
                     "ocr_processed": ocr_processed,
                     "processing_status": "done",
@@ -127,7 +146,19 @@ class IngestPipeline:
             }
 
     async def _flush_batch(self, batch: list) -> tuple[int, int]:
-        """Commit a batch of processed books to DB. Returns (saved, failed)."""
+        """Commit a batch of processed books to the database.
+
+        For each result in the batch:
+          - If the book already exists (force_rescan), update it and re-chunk
+          - Otherwise, create a new book record and its chunks
+
+        After the DB commit succeeds, vector embeddings are generated for
+        all chunks in a separate try/except so FAISS errors don't roll back
+        the stored data.
+
+        Returns:
+            Tuple of (successfully_saved_count, failed_count).
+        """
         if not batch:
             return 0, 0
         saved = 0
@@ -144,57 +175,98 @@ class IngestPipeline:
                                 # Update existing book
                                 from db.crud import update_book
                                 data = result["data"]
-                                book = await update_book(session, existing.id, **data)
+                                book = await update_book(session, existing.id, **{k: v for k, v in data.items() if k != "chunks"})
                             else:
                                 # Create new book
-                                book = await create_book(session, **result["data"])
+                                book = await create_book(session, **{k: v for k, v in result["data"].items() if k != "chunks"})
+                            
+                            # Save chunks (even for existing books, we re-chunk on rescan)
+                            if "chunks" in result["data"]:
+                                # Delete old chunks first if updating
+                                if existing:
+                                    from sqlalchemy import delete
+                                    from db.models import Chunk
+                                    await session.execute(delete(Chunk).where(Chunk.book_id == existing.id))
+                                
+                                await create_chunks(session, book.id, result["data"]["chunks"])
                             
                             books_to_embed.append(book)
                             saved += 1
                         except Exception as e:
-                            logger.error("Failed to store book record: %s", e)
+                            logger.error("Failed to store book/chunks: %s", e)
                             failed += 1
                     else:
                         failed += 1
                 await session.commit()
         except Exception as e:
-            logger.error("Batch DB commit failed: %s", e)
+            logger.error("Batch DB commit failed: %s\n%s", e, traceback.format_exc())
             # Count all as failed if whole batch fails
             failed = len(batch)
             saved = 0
             return saved, failed
 
-        # Batch vector embedding outside the DB session
-        await self._embed_books(books_to_embed)
+        # Batch vector embedding outside the DB session.
+        # Wrapped in its own try-except to prevent vector errors from rolling back the main DB storage.
+        try:
+            await self._embed_books(books_to_embed)
+        except Exception as e:
+            logger.warning("Vector indexing delayed for batch: %s. Books were saved, but may not be searchable semantically until next heal.", e)
 
         return saved, failed
 
     async def _embed_books(self, books: list) -> None:
-        """Generate and store embeddings for a list of book objects."""
+        """Generate and store vector embeddings for all chunks of the given books.
+
+        Each chunk's text is prepended with the book's title and author to
+        provide context, improving semantic search relevance.  The resulting
+        vector IDs are written back to the Chunk.vector_id column.
+        """
         if not books:
             return
         try:
             from search.vector_store import vector_store
-            texts = [
-                f"{b.title} {b.author} {b.text_content[:2000] if b.text_content else ''}"
-                for b in books
-            ]
-            ids = [b.id for b in books]
-            vector_ids = await vector_store.add_texts(texts, ids)
+            
+            async with async_session() as session:
+                all_texts = []
+                all_chunk_ids = []
+                
+                for book in books:
+                    try:
+                        chunks = await get_chunks_for_book(session, book.id)
+                        for chunk in chunks:
+                            # Contextualize chunk with title/author for better semantic matching
+                            contextual_text = f"{book.title} {book.author} {chunk.content}"
+                            all_texts.append(contextual_text)
+                            all_chunk_ids.append(chunk.id)
+                    except Exception as e:
+                         logger.warning("Failed to collect chunks for book %s (ID: %d): %s", book.title, book.id, e)
+                
+                if not all_texts:
+                    return
 
-            # Update vector_ids in DB
-            updates = [(b.id, vid) for b, vid in zip(books, vector_ids) if vid is not None]
-            if updates:
-                async with async_session() as session:
-                    from db.crud import update_book
-                    for book_id, vid in updates:
-                        await update_book(session, book_id, vector_id=vid)
-                    await session.commit()
+                logger.info("Generating embeddings for %d chunks", len(all_texts))
+                try:
+                    vector_ids = await vector_store.add_texts(all_texts, all_chunk_ids)
+
+                    # Update vector_ids in Chunk table
+                    for chunk_id, vid in zip(all_chunk_ids, vector_ids):
+                        if vid is not None:
+                            await update_chunk(session, chunk_id, vector_id=vid)
+                except Exception as e:
+                    logger.error("FAISS index update failed in batch: %s", e)
+                
+                await session.commit()
         except Exception as e:
-            logger.warning("Batch vector indexing failed: %s", e)
+            logger.warning("Batch vector indexing process hit a high-level error: %s\n%s", e, traceback.format_exc())
 
     async def run(self, directories: List[Path], status: dict = None, force_rescan: bool = False) -> None:
-        """Run the full ingest pipeline with parallel file processing."""
+        """Run the full ingest pipeline with parallel file processing.
+
+        Args:
+            directories: List of directory paths to scan for ebook files.
+            status: Mutable dict for real-time progress reporting (polled by the API).
+            force_rescan: If True, re-process files that are already in the database.
+        """
         loop = asyncio.get_running_loop()
         counter_lock = asyncio.Lock()
         batch: list = []
@@ -212,13 +284,14 @@ class IngestPipeline:
             return
 
         processed_count = 0
+        skipped_count = 0
         failed_count = 0
         
         # Memory-efficient task processing using a queue
         queue: asyncio.Queue = asyncio.Queue(maxsize=settings.max_workers * 2)
 
         async def worker():
-            nonlocal processed_count, failed_count, batch
+            nonlocal processed_count, skipped_count, failed_count, batch
             while True:
                 file_path = await queue.get()
                 if file_path is None:
@@ -231,10 +304,10 @@ class IngestPipeline:
                         existing = await get_book_by_path(session, str(file_path))
                         if existing and not force_rescan:
                             async with counter_lock:
-                                processed_count += 1
+                                skipped_count += 1
                                 if status is not None:
-                                    status["processed_files"] = processed_count
-                                    status["progress_percent"] = (processed_count + failed_count) / total * 100
+                                    status["skipped_files"] = skipped_count
+                                    status["progress_percent"] = (processed_count + skipped_count + failed_count) / total * 100
                             queue.task_done()
                             continue
                     
@@ -268,8 +341,9 @@ class IngestPipeline:
                 finally:
                     if status is not None:
                         status["processed_files"] = processed_count
+                        status["skipped_files"] = skipped_count
                         status["failed_files"] = failed_count
-                        status["progress_percent"] = (processed_count + failed_count) / total * 100
+                        status["progress_percent"] = (processed_count + skipped_count + failed_count) / total * 100
                     queue.task_done()
 
         # Start workers

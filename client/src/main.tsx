@@ -1,3 +1,10 @@
+/**
+ * Application entry point.
+ *
+ * Mounts the React app into the DOM with BrowserRouter for client-side
+ * routing and StrictMode for development warnings.
+ */
+
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter } from 'react-router-dom'

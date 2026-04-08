@@ -1,14 +1,22 @@
 /**
  * API client for BookBrain backend.
  *
- * Supports both local sidecar mode (localhost:8000) and remote NAS mode
- * (user-configured URL). The backend URL is stored in localStorage.
+ * Supports two deployment modes:
+ *   - **Local/sidecar**: Backend runs on localhost:8000 alongside the frontend.
+ *     In Vite dev mode (port 1420), requests go through Vite's proxy as "/api".
+ *   - **Remote/NAS**: User configures a custom backend URL via the Settings page.
+ *     The URL is persisted in localStorage and used for all API calls.
+ *
+ * The `api` object at the bottom provides typed methods for every backend endpoint.
  */
 
+/** Default backend URL when no custom URL is configured. */
 const DEFAULT_BACKEND = 'http://localhost:8000';
+
+/** localStorage key for persisting the user-configured backend URL. */
 const STORAGE_KEY = 'bookbrain_backend_url';
 
-/** Get the configured backend URL. */
+/** Get the configured backend URL (from localStorage or default). */
 export function getBackendUrl(): string {
     if (typeof window !== 'undefined') {
         return localStorage.getItem(STORAGE_KEY) || DEFAULT_BACKEND;
@@ -16,27 +24,31 @@ export function getBackendUrl(): string {
     return DEFAULT_BACKEND;
 }
 
-/** Set the backend URL. */
+/** Set and persist the backend URL (strips trailing slashes). */
 export function setBackendUrl(url: string) {
-    const cleaned = url.replace(/\/+$/, ''); // Remove trailing slashes
+    const cleaned = url.replace(/\/+$/, '');
     localStorage.setItem(STORAGE_KEY, cleaned);
 }
 
-/** Check if running inside Tauri desktop app. */
+/** Check if running inside the Tauri desktop app (vs. browser). */
 export function isTauri(): boolean {
     return !!(window as any).__TAURI_INTERNALS__;
 }
 
+/**
+ * Resolve the API base URL.
+ * - In Vite dev mode (port 1420): use "/api" (proxied by Vite to localhost:8000)
+ * - In Tauri or production: use the configured backend URL + "/api"
+ */
 function getApiBase(): string {
-    // In web dev mode (Vite proxy), use relative path
     if (!isTauri() && window.location.port === '1420') {
         return '/api';
     }
-    // Otherwise use configured backend URL
     return `${getBackendUrl()}/api`;
 }
 
-// ─── Types ──────────────────────────────────────────
+// ─── TypeScript Interfaces ────────────────────────────
+// These mirror the Pydantic schemas defined in server/api/schemas.py.
 
 export interface Book {
     id: number;
@@ -95,6 +107,8 @@ export interface UnifiedSearchResult {
     source: 'keyword' | 'semantic';
     filename?: string;
     context?: string;
+    page_number?: number;
+    location_tag?: string;
 }
 
 export interface UnifiedSearchResponse {
@@ -109,6 +123,7 @@ export interface IngestStatus {
     is_running: boolean;
     total_files: number;
     processed_files: number;
+    skipped_files: number;
     failed_files: number;
     current_file?: string;
     errors: string[];
@@ -155,8 +170,13 @@ export interface Stats {
     total_size_bytes: number;
 }
 
-// ─── API Fetch ──────────────────────────────────────
+// ─── API Fetch Helper ─────────────────────────────────
 
+/**
+ * Generic fetch wrapper that prepends the API base URL, sets JSON headers,
+ * and parses the response.  Throws an Error with the server's detail message
+ * on non-2xx responses.
+ */
 async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
     const base = getApiBase();
     const res = await fetch(`${base}${url}`, {
@@ -170,7 +190,10 @@ async function apiFetch<T>(url: string, options?: RequestInit): Promise<T> {
     return res.json();
 }
 
-/** Check if the backend is reachable. */
+/**
+ * Quick health check — returns true if the backend root endpoint responds
+ * within 3 seconds.  Used by the Settings page to validate backend URLs.
+ */
 export async function checkBackendHealth(): Promise<boolean> {
     try {
         const url = getBackendUrl();
@@ -181,10 +204,11 @@ export async function checkBackendHealth(): Promise<boolean> {
     }
 }
 
-// ─── API Methods ────────────────────────────────────
+// ─── API Methods ──────────────────────────────────────
+// Each method maps 1:1 to a backend endpoint defined in server/api/routes.py.
 
 export const api = {
-    // Books
+    // --- Books ---
     getBooks: (params: {
         page?: number;
         page_size?: number;
@@ -212,36 +236,42 @@ export const api = {
     deleteBook: (id: number) =>
         apiFetch<{ message: string }>(`/books/${id}`, { method: 'DELETE' }),
 
-    getCoverUrl: (id: number) => `${getApiBase()}/books/${id}/cover`,
+    /** Build a direct URL to a book's cover image (used in <img src>). */
+    getCoverUrl: (id: number) => `${getApiBase()}/books/${id}/cover?v=${id}`,
 
+    /** Build a direct URL to the original ebook file (for the reader). */
     getFileUrl: (id: number) => `${getApiBase()}/books/${id}/file`,
 
-    // Categories
+    // --- Categories ---
     getCategories: () => apiFetch<Category[]>('/categories'),
 
-    // Search
+    // --- Search ---
+    /** Pure semantic search (FAISS vector similarity only). */
     search: (q: string, limit?: number) => {
         const qs = new URLSearchParams({ q });
         if (limit) qs.set('limit', String(limit));
         return apiFetch<SearchResponse>(`/search?${qs}`);
     },
 
+    /** Unified search combining FTS5 keyword + FAISS semantic results. */
     searchUnified: (q: string, limit?: number) => {
         const qs = new URLSearchParams({ q });
         if (limit) qs.set('limit', String(limit));
         return apiFetch<UnifiedSearchResponse>(`/search/unified?${qs}`);
     },
 
-    // Ingest
+    // --- Ingest ---
+    /** Start the import pipeline (runs in the background on the server). */
     triggerIngest: (params: { directories?: string[]; force_rescan?: boolean } = {}) =>
         apiFetch<IngestStatus>('/ingest', {
             method: 'POST',
             body: JSON.stringify(params),
         }),
 
+    /** Poll the current import progress (file counts, percentage, errors). */
     getIngestStatus: () => apiFetch<IngestStatus>('/ingest/status'),
 
-    // Settings
+    // --- Settings ---
     getSettings: () => apiFetch<Settings>('/settings'),
 
     updateSettings: (data: Partial<Settings>) =>
@@ -250,17 +280,18 @@ export const api = {
             body: JSON.stringify(data),
         }),
 
-    // Stats
+    // --- Stats ---
+    /** Library statistics (total books, format distribution, total size). */
     getStats: () => apiFetch<Stats>('/stats'),
 
-    // Admin
+    // --- Admin ---
     browseFiles: (path?: string) => {
         const qs = new URLSearchParams();
         if (path) qs.set('path', path);
         return apiFetch<FileBrowserResponse>(`/admin/browse?${qs}`);
     },
 
-    // Annotations
+    // --- Annotations ---
     getAnnotations: (bookId: number) => apiFetch<Annotation[]>(`/books/${bookId}/annotations`),
     
     createAnnotation: (bookId: number, data: { location: string; selected_text: string; note?: string; color?: string }) =>

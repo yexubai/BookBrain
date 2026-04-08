@@ -1,20 +1,45 @@
+/**
+ * SearchPage — Unified search results page.
+ *
+ * Calls the `/api/search/unified` endpoint which combines FTS5 keyword
+ * matching and FAISS semantic search.  Results show source badges
+ * ("Keyword" / "Semantic"), relevance scores, matched text snippets,
+ * and page-level jump-to-read links.
+ *
+ * Search is debounced by 500ms to avoid hammering the backend while typing.
+ */
+
 import { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { api, Book, UnifiedSearchResult } from '../api'
 import BookDetail from '../components/BookDetail'
-import { FiSearch, FiBook, FiTag, FiCpu } from 'react-icons/fi'
+import { FiSearch, FiBook, FiTag, FiCpu, FiBookOpen, FiInfo } from 'react-icons/fi'
 
 interface SearchPageProps {
-    query: string
+    query: string  // Current search text from the Topbar input
 }
 
 export default function SearchPage({ query }: SearchPageProps) {
+    const navigate = useNavigate()
     const [results, setResults] = useState<UnifiedSearchResult[]>([])
-    const [keywordCount, setKeywordCount] = useState(0)
-    const [semanticCount, setSemanticCount] = useState(0)
+    const [keywordCount, setKeywordCount] = useState(0)    // Results from FTS5
+    const [semanticCount, setSemanticCount] = useState(0)  // Results from FAISS
     const [loading, setLoading] = useState(false)
-    const [searched, setSearched] = useState(false)
+    const [searched, setSearched] = useState(false)        // True after first search attempt
     const [selectedBook, setSelectedBook] = useState<Book | null>(null)
+    const [selectedPage, setSelectedPage] = useState<number | undefined>(undefined)
+    const [selectedLocation, setSelectedLocation] = useState<string | undefined>(undefined)
 
+    /** Navigate to the reader, optionally jumping to a specific page/location. */
+    const openReader = (book: Book, pageNumber?: number, locationTag?: string) => {
+        let url = `/reader?id=${book.id}`
+        if (pageNumber) url += `&page=${pageNumber}`
+        if (locationTag) url += `&location=${encodeURIComponent(locationTag)}`
+        navigate(url)
+    }
+
+    // Debounced search: waits 500ms after the user stops typing before firing the API call.
+    // The cleanup function cancels the timer if the query changes before the timeout.
     useEffect(() => {
         if (!query.trim()) {
             setResults([])
@@ -76,8 +101,10 @@ export default function SearchPage({ query }: SearchPageProps) {
                 </div>
             ) : (
                 <div className="search-results">
-                    {results.map(({ book, score, source, filename, context }) => (
-                        <div key={book.id} className="search-result-item" onClick={() => setSelectedBook(book)}>
+                    {results.map((result) => {
+                        const { book, score, source, filename, context, page_number, location_tag } = result
+                        return (
+                        <div key={`${source}-${book.id}-${page_number || location_tag || Math.random()}`} className="search-result-item" onClick={() => openReader(book, page_number, location_tag)}>
                             <div className="result-cover">
                                 {book.cover_path ? (
                                     <img src={api.getCoverUrl(book.id)} alt={book.title} loading="lazy" />
@@ -95,15 +122,20 @@ export default function SearchPage({ query }: SearchPageProps) {
                                         <span style={{ opacity: 0.7 }}>📄</span> {filename}
                                     </div>
                                 )}
+                                {page_number && (
+                                    <div style={{ fontSize: '11px', color: 'var(--accent)', marginTop: '2px', fontWeight: 600 }}>
+                                        <FiBookOpen style={{ marginRight: '4px', verticalAlign: 'middle' }} /> Jump to Page {page_number}
+                                    </div>
+                                )}
                                 <div className="result-summary">{book.summary || 'No summary available'}</div>
                                 {context && (
                                     <div className="result-context">
                                         <span style={{ fontSize: '10px', color: 'var(--accent)', fontWeight: 'bold', marginRight: '6px', textTransform: 'uppercase', letterSpacing: '0.03em' }}>
                                             Matched text
                                         </span>
-                                        <div 
+                                        <div
                                             style={{ display: 'inline', fontSize: '12.5px', color: 'var(--text-secondary)', lineHeight: '1.5' }}
-                                            dangerouslySetInnerHTML={{ __html: context }} 
+                                            dangerouslySetInnerHTML={{ __html: context }}
                                         />
                                     </div>
                                 )}
@@ -124,14 +156,37 @@ export default function SearchPage({ query }: SearchPageProps) {
                                         ? <><FiTag size={9} /> Keyword</>
                                         : <><FiCpu size={9} /> Semantic</>}
                                 </div>
+                                <button
+                                    className="btn-icon"
+                                    style={{ padding: '4px', fontSize: '14px' }}
+                                    title="Book details"
+                                    onClick={(e) => {
+                                        e.stopPropagation()
+                                        setSelectedBook(book)
+                                        setSelectedPage(page_number)
+                                        setSelectedLocation(location_tag)
+                                    }}
+                                >
+                                    <FiInfo />
+                                </button>
                             </div>
                         </div>
-                    ))}
+                        )
+                    })}
                 </div>
             )}
 
             {selectedBook && (
-                <BookDetail book={selectedBook} onClose={() => setSelectedBook(null)} />
+                <BookDetail 
+                    book={selectedBook} 
+                    pageNumber={selectedPage} 
+                    locationTag={selectedLocation} 
+                    onClose={() => {
+                        setSelectedBook(null)
+                        setSelectedPage(undefined)
+                        setSelectedLocation(undefined)
+                    }} 
+                />
             )}
         </div>
     )

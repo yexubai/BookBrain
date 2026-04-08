@@ -1,3 +1,13 @@
+/**
+ * Topbar — Global search input and backend connection status indicator.
+ *
+ * Contains:
+ *   - A search input that updates the app-level searchQuery state in real time.
+ *     Pressing Enter navigates to the dedicated /search page.
+ *   - A connection status dot (green/red) that polls the backend health
+ *     endpoint every 15 seconds.  Clicking it navigates to Settings.
+ */
+
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { FiSearch, FiCircle } from 'react-icons/fi'
@@ -10,16 +20,18 @@ interface TopbarProps {
 
 export default function Topbar({ searchQuery, onSearchChange }: TopbarProps) {
     const navigate = useNavigate()
-    const [connected, setConnected] = useState<boolean | null>(null)
+    const [connected, setConnected] = useState<boolean | null>(null) // null = checking
 
+    // Poll backend health on mount and every 15 seconds
     useEffect(() => {
         checkBackendHealth().then(setConnected).catch(() => setConnected(false))
         const interval = setInterval(() => {
             checkBackendHealth().then(setConnected).catch(() => setConnected(false))
-        }, 15000) // Check every 15s
+        }, 15000)
         return () => clearInterval(interval)
     }, [])
 
+    /** Navigate to the search page when Enter is pressed with a non-empty query. */
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter' && searchQuery.trim()) {
             navigate('/search')

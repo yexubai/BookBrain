@@ -1,3 +1,17 @@
+/**
+ * IngestPage — Import management page.
+ *
+ * Allows the user to:
+ *   1. View library statistics (total books, categories, formats, size)
+ *   2. Configure directories to scan (via text input or FileBrowser modal)
+ *   3. Start an import with optional force-rescan
+ *   4. Monitor real-time progress (polls /api/ingest/status every 2 seconds)
+ *   5. See errors and completion summary
+ *
+ * In Tauri desktop mode, the native OS folder picker is used;
+ * otherwise falls back to the server-side FileBrowser component.
+ */
+
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api, IngestStatus, Stats, isTauri } from '../api'
 import { FiUploadCloud, FiCheckCircle, FiAlertCircle, FiFolder } from 'react-icons/fi'
@@ -90,8 +104,11 @@ export default function IngestPage() {
                     if (!s.is_running) {
                         if (pollRef.current) clearInterval(pollRef.current)
                         api.getStats().then(setStats)
-                        setToast({ type: 'success', msg: `Processing complete! ${s.processed_files} books imported.` })
-                        setTimeout(() => setToast(null), 5000)
+                        const msg = s.processed_files > 0 
+                            ? `Import complete: ${s.processed_files} new books added${s.skipped_files > 0 ? `, ${s.skipped_files} already in library` : ''}.`
+                            : `Scan complete: ${s.skipped_files} books were already in library.`
+                        setToast({ type: 'success', msg })
+                        setTimeout(() => setToast(null), 6000)
                     }
                 } catch (e) { /* ignore poll errors */ }
             }, 2000)
@@ -210,7 +227,7 @@ export default function IngestPage() {
                             <div className="progress-bar" style={{ width: `${status.progress_percent}%` }} />
                         </div>
                         <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '8px' }}>
-                            {status.processed_files} / {status.total_files} files processed
+                            {status.processed_files} new, {status.skipped_files} existing, {status.total_files} total
                             {status.failed_files > 0 && `, ${status.failed_files} failed`}
                         </div>
                     </div>
@@ -231,10 +248,16 @@ export default function IngestPage() {
                 )}
 
                 {/* Complete */}
-                {status && !status.is_running && status.processed_files > 0 && (
-                    <div style={{ marginTop: '16px', display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--success)', fontSize: '14px' }}>
-                        <FiCheckCircle />
-                        Import complete: {status.processed_files} books processed
+                {status && !status.is_running && (status.processed_files > 0 || status.skipped_files > 0) && (
+                    <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '4px', color: 'var(--success)', fontSize: '14px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <FiCheckCircle />
+                            Import complete
+                        </div>
+                        <div style={{ paddingLeft: '24px', fontSize: '12px', opacity: 0.8 }}>
+                            {status.processed_files} new books added.
+                            {status.skipped_files > 0 && ` ${status.skipped_files} already in your library.`}
+                        </div>
                     </div>
                 )}
             </div>

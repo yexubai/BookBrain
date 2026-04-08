@@ -1,4 +1,15 @@
-"""Pydantic schemas for API request/response models."""
+"""Pydantic schemas for API request/response models.
+
+Defines all data transfer objects (DTOs) used by the REST API:
+  - Book schemas (list, detail, update)
+  - Category tree schemas
+  - Search result schemas (pure semantic + unified keyword/semantic)
+  - Ingest pipeline status
+  - Settings read/update
+  - Library statistics
+  - File browser (server-side directory listing)
+  - Annotation CRUD schemas
+"""
 
 from datetime import datetime
 from typing import Optional, List
@@ -9,7 +20,7 @@ from pydantic import BaseModel, Field
 # ─── Book Schemas ───────────────────────────────────────────────
 
 class BookBase(BaseModel):
-    """Shared book properties."""
+    """Shared book properties used in both responses and updates."""
     title: str
     author: str = "Unknown"
     isbn: Optional[str] = None
@@ -23,7 +34,7 @@ class BookBase(BaseModel):
 
 
 class BookResponse(BookBase):
-    """Book response model."""
+    """Full book response model including file info and timestamps."""
     id: int
     format: str
     file_path: str
@@ -84,6 +95,8 @@ class SearchResult(BaseModel):
     book: BookResponse
     score: float = 0.0
     context: Optional[str] = None
+    page_number: Optional[int] = None
+    location_tag: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -94,23 +107,32 @@ class SearchResponse(BaseModel):
 
 
 class UnifiedSearchResult(BaseModel):
-    """Single result from unified search (keyword + semantic combined)."""
+    """Single result from unified search (keyword + semantic combined).
+
+    The ``source`` field indicates how this result was found:
+      - "keyword": FTS5 match on title/author/filename/summary/content
+      - "semantic": FAISS vector similarity match by meaning
+    """
     book: BookResponse
     score: float = 0.0
-    # "keyword" = FTS5 match on title/author/filename/summary/content
-    # "semantic" = FAISS vector similarity match
-    source: str = "keyword"
-    filename: Optional[str] = None   # file stem for display
-    context: Optional[str] = None    # Match snippet with <b> tags
+    source: str = "keyword"              # "keyword" or "semantic"
+    filename: Optional[str] = None       # File stem for display
+    context: Optional[str] = None        # Match snippet with <b> highlight tags
+    page_number: Optional[int] = None    # Page/chapter where the match was found
+    location_tag: Optional[str] = None   # EPUB CFI or PDF page tag for navigation
 
 
 class UnifiedSearchResponse(BaseModel):
-    """Response from the unified search endpoint."""
+    """Response from the unified search endpoint.
+
+    Includes counts of how many results came from each search engine,
+    allowing the frontend to display source distribution badges.
+    """
     query: str
     results: List[UnifiedSearchResult]
     total: int
-    keyword_count: int = 0
-    semantic_count: int = 0
+    keyword_count: int = 0      # Number of results from FTS5 keyword search
+    semantic_count: int = 0     # Number of results from FAISS semantic search
 
 
 # ─── Ingest Schemas ─────────────────────────────────────────────
@@ -125,14 +147,15 @@ class IngestRequest(BaseModel):
 
 
 class IngestStatus(BaseModel):
-    """Ingest pipeline status."""
+    """Real-time ingest pipeline status, polled by the frontend."""
     is_running: bool = False
-    total_files: int = 0
-    processed_files: int = 0
-    failed_files: int = 0
-    current_file: Optional[str] = None
-    errors: List[str] = []
-    progress_percent: float = 0.0
+    total_files: int = 0           # Total ebook files discovered
+    processed_files: int = 0       # Successfully processed so far
+    skipped_files: int = 0         # Already in DB (not force_rescan)
+    failed_files: int = 0          # Failed during processing
+    current_file: Optional[str] = None  # Filename currently being processed
+    errors: List[str] = []         # Error messages for failed files
+    progress_percent: float = 0.0  # 0.0 to 100.0
 
 
 # ─── Settings Schemas ───────────────────────────────────────────
@@ -185,7 +208,7 @@ class FileBrowserResponse(BaseModel):
 # ─── Annotation Schemas ─────────────────────────────────────────
 
 class AnnotationBase(BaseModel):
-    """Base annotation properties."""
+    """Base annotation properties shared between create and response schemas."""
     location: str
     selected_text: str
     note: Optional[str] = ""

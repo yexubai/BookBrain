@@ -1,4 +1,18 @@
-"""Two-tier book classification: rule-based + ML zero-shot."""
+"""Two-tier book classification: rule-based keywords + ML zero-shot fallback.
+
+Classification strategy:
+  1. **Rule-based**: Scan title + author + text for predefined keywords.
+     Each keyword match increments a score; if the best category scores >= 3
+     it is accepted.  This is fast and requires no model loading.
+  2. **ML zero-shot**: Encode the text and all category labels using
+     sentence-transformers, then pick the label with the highest cosine
+     similarity (threshold >= 0.3).  This handles books that don't match
+     any keyword rules.
+  3. **Fallback**: If neither method is confident, return "Uncategorized".
+
+The ML model is shared as a class-level singleton to avoid reloading
+the ~90 MB model for each classification.
+"""
 
 import logging
 import re
@@ -7,7 +21,10 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# ─── Rule-based keyword categories ──────────────────────────────
+# ─── Rule-based keyword categories ─────────────────────────────
+# Nested dict structure: { Category: { Subcategory: [keywords...] } }
+# Keywords are matched case-insensitively against the combined
+# title + author + text string.
 
 CATEGORY_RULES: Dict[str, Dict[str, list]] = {
     "Programming": {
@@ -71,7 +88,8 @@ CATEGORY_RULES: Dict[str, Dict[str, list]] = {
     },
 }
 
-# Flatten for ML labels
+# Flatten the nested category structure into "Category / Subcategory" strings
+# for use as candidate labels in zero-shot ML classification.
 ML_CATEGORIES = []
 for cat, subcats in CATEGORY_RULES.items():
     for subcat in subcats:
@@ -79,14 +97,23 @@ for cat, subcats in CATEGORY_RULES.items():
 
 
 class Classifier:
-    """Two-tier book classifier: rules first, ML fallback."""
+    """Two-tier book classifier: rules first, ML zero-shot fallback.
 
-    _shared_model = None  # Class-level shared model
-    _model_load_failed = False  # Don't retry if loading failed
-    _load_lock = threading.Lock() # Thread-safe lock for loading
+    Thread-safe: the sentence-transformers model is lazily loaded once
+    and shared across all Classifier instances and threads.
+    """
+
+    _shared_model = None           # Shared sentence-transformers model (lazy-loaded)
+    _model_load_failed = False     # Skip retries if model loading failed once
+    _load_lock = threading.Lock()  # Thread-safe initialisation guard
 
     def _rule_classify(self, text: str) -> Optional[Dict[str, str]]:
-        """Try to classify using keyword rules."""
+        """Attempt classification using keyword frequency scoring.
+
+        Counts occurrences of each subcategory's keywords in the text
+        (case-insensitive, capped at 5 per keyword to prevent bias).
+        Accepts the best match only if its total score >= 3.
+        """
         text_lower = text.lower()
 
         best_match = None
@@ -111,8 +138,13 @@ class Classifier:
         return None
 
     def _ml_classify(self, text: str) -> Optional[Dict[str, str]]:
-        """Classify using sentence-transformers zero-shot approach."""
-        # Skip if model loading already failed
+        """Classify using sentence-transformers zero-shot cosine similarity.
+
+        Encodes the first 1000 chars of text and all ML_CATEGORIES labels,
+        then finds the label with the highest cosine similarity.  Returns
+        None if the best similarity is below 0.3 (not confident enough).
+        """
+        # Skip if model loading already failed in this process
         if Classifier._model_load_failed:
             return None
 
@@ -160,10 +192,20 @@ class Classifier:
         text: str = "",
         author: str = "",
     ) -> Dict[str, str]:
-        """Classify a book using rules then ML fallback."""
+        """Classify a book into a category and subcategory.
+
+        Args:
+            title: Book title.
+            text: First ~5000 chars of extracted text content.
+            author: Author name.
+
+        Returns:
+            Dict with "category" and "subcategory" keys.
+            Falls back to {"category": "Uncategorized", "subcategory": None}.
+        """
         combined = f"{title} {author} {text}"
 
-        # Try rules first (faster, no network needed)
+        # Try rules first (instantaneous, no model needed)
         result = self._rule_classify(combined)
         if result:
             logger.info("Rule-classified: %s → %s/%s", title[:50], result["category"], result["subcategory"])

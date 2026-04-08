@@ -1,12 +1,23 @@
+/**
+ * FileBrowser — Server-side directory picker modal.
+ *
+ * Calls the `/api/admin/browse` endpoint to list directories on the
+ * backend's filesystem.  Used in the Settings and Ingest pages when the
+ * user needs to select ebook directories without typing paths manually.
+ *
+ * In Tauri desktop mode, the native file dialog is preferred; this
+ * component serves as a fallback for web-only or remote NAS scenarios.
+ */
+
 import { useState, useEffect } from 'react'
 import { api, FileBrowserItem } from '../api'
 import { FiFolder, FiChevronRight, FiHardDrive, FiChevronLeft, FiCheck } from 'react-icons/fi'
 
 interface FileBrowserProps {
-    onSelect: (path: string) => void
-    onClose: () => void
-    initialPath?: string
-    title?: string
+    onSelect: (path: string) => void   // Called with the chosen directory path
+    onClose: () => void                // Close the modal without selecting
+    initialPath?: string               // Starting directory to browse
+    title?: string                     // Modal title (defaults to "Select Folder")
 }
 
 export default function FileBrowser({ onSelect, onClose, initialPath, title = 'Select Folder' }: FileBrowserProps) {

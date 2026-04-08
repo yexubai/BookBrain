@@ -1,16 +1,59 @@
+/**
+ * ReaderPage — Built-in ebook reader with annotation support.
+ *
+ * Supports two formats:
+ *   - **PDF**: Rendered page-by-page using pdf.js (pdfjs-dist).
+ *     Features: page navigation, zoom, text selection highlighting,
+ *     annotation overlays, table of contents sidebar.
+ *   - **EPUB**: Rendered using epub.js (ePub.js).
+ *     Features: chapter navigation, CFI-based annotations, TOC sidebar.
+ *
+ * URL query parameters:
+ *   - id:       Book ID to load (required)
+ *   - page:     Initial page number to jump to (PDF only)
+ *   - location: Initial CFI or location tag to navigate to (EPUB)
+ *
+ * Annotations (highlights + notes) are persisted via the /api/annotations
+ * endpoints and rendered as colored overlays on top of the document.
+ */
+
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { api, Book, Annotation } from '../api'
-import { FiArrowLeft, FiChevronLeft, FiChevronRight, FiZoomIn, FiZoomOut, FiMaximize, FiEdit3, FiCopy, FiTrash2, FiX } from 'react-icons/fi'
+import { FiArrowLeft, FiChevronLeft, FiChevronRight, FiZoomIn, FiZoomOut, FiMaximize, FiEdit3, FiCopy, FiTrash2, FiX, FiList } from 'react-icons/fi'
 import * as pdfjsLib from 'pdfjs-dist'
 import 'pdfjs-dist/web/pdf_viewer.css'
 
-// Set worker to a more reliable local-ish path or at least handle errors
-// In a real production app, this should be bundled or put in public/
+// Configure the pdf.js web worker (runs PDF parsing off the main thread).
+// In production, this should ideally be bundled or served from public/.
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`
 
-// ─── Shared UI Components ───────────────────────────────────────
+// ─── Shared UI Components ──────────────────────────────────────
 
+/** Recursive table-of-contents sidebar for both PDF and EPUB. */
+function TocSidebar({ items, onNavigate, level = 0 }: { items: any[]; onNavigate: (item: any) => void; level?: number }) {
+    return (
+        <>
+            {items.map((item, i) => (
+                <div key={`${level}-${i}-${item.title || item.label}`}>
+                    <div
+                        className="toc-item"
+                        style={{ paddingLeft: `${16 + level * 14}px` }}
+                        onClick={() => item.title && onNavigate(item)}
+                        title={item.title || item.label}
+                    >
+                        {item.title || item.label}
+                    </div>
+                    {item.items?.length > 0 && (
+                        <TocSidebar items={item.items} onNavigate={onNavigate} level={level + 1} />
+                    )}
+                </div>
+            ))}
+        </>
+    )
+}
+
+/** Available highlight colors for annotations. */
 export const COLORS = [
     { name: 'yellow', hex: 'rgba(255, 235, 59, 0.4)' },
     { name: 'green', hex: 'rgba(76, 175, 80, 0.3)' },
@@ -96,6 +139,19 @@ function TextReader({ book }: { book: Book }) {
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [fontSize, setFontSize] = useState(16)
+    const viewerRef = useRef<HTMLDivElement>(null)
+
+    useEffect(() => {
+        const el = viewerRef.current
+        if (!el) return
+        const handleWheel = (e: WheelEvent) => {
+            if (!e.ctrlKey) return
+            e.preventDefault()
+            setFontSize(s => Math.min(32, Math.max(12, s + (e.deltaY < 0 ? 1 : -1))))
+        }
+        el.addEventListener('wheel', handleWheel, { passive: false })
+        return () => el.removeEventListener('wheel', handleWheel)
+    }, [loading])
 
     useEffect(() => {
         const load = async () => {
@@ -139,7 +195,7 @@ function TextReader({ book }: { book: Book }) {
                 </button>
             </div>
 
-            <div className="text-viewer" style={{
+            <div ref={viewerRef} className="text-viewer" style={{
                 flex: 1,
                 overflowY: 'auto',
                 padding: '40px 10%',
@@ -264,14 +320,17 @@ function PdfPageCanvas({
     )
 }
 
-function PdfReader({ bookId }: { bookId: number }) {
+function PdfReader({ bookId, initialPage }: { bookId: number; initialPage?: number }) {
     const scrollContainerRef = useRef<HTMLDivElement>(null)
     const [pdfDoc, setPdfDoc] = useState<any>(null)
     const [totalPages, setTotalPages] = useState(0)
     const [currentPage, setCurrentPage] = useState(1)
+    const currentPageRef = useRef(1)
     const [scale, setScale] = useState(1.5)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
+    const [outline, setOutline] = useState<any[]>([])
+    const [showToc, setShowToc] = useState(false)
 
     useEffect(() => {
         const load = async () => {
@@ -280,6 +339,8 @@ function PdfReader({ bookId }: { bookId: number }) {
                 const doc = await pdfjsLib.getDocument(url).promise
                 setPdfDoc(doc)
                 setTotalPages(doc.numPages)
+                const items = await doc.getOutline()
+                setOutline(items || [])
                 setLoading(false)
             } catch (e: any) {
                 console.error("PDF loading error:", e)
@@ -290,6 +351,49 @@ function PdfReader({ bookId }: { bookId: number }) {
         load()
     }, [bookId])
 
+    const goToPage = useCallback((pageNum: number, retryCount = 0) => {
+        const container = scrollContainerRef.current
+        if (!container) return
+
+        const wrapper = container.querySelector(`[data-page="${pageNum}"]`) as HTMLElement
+        if (wrapper) {
+            // High-precision scroll calculation using bounding rects
+            const containerRect = container.getBoundingClientRect()
+            const wrapperRect = wrapper.getBoundingClientRect()
+            const relativeTop = wrapperRect.top - containerRect.top + container.scrollTop
+
+            container.scrollTo({
+                top: relativeTop,
+                behavior: retryCount === 0 ? 'smooth' : 'auto'
+            })
+        } else if (retryCount < 20) {
+            // Keep trying for up to 6 seconds (React component mount delay)
+            setTimeout(() => goToPage(pageNum, retryCount + 1), 300)
+        }
+    }, [])
+
+    const navigateOutline = useCallback(async (item: any) => {
+        if (!pdfDoc) return
+        try {
+            let dest = item.dest
+            if (!dest) return
+            if (typeof dest === 'string') dest = await pdfDoc.getDestination(dest)
+            if (!dest) return
+            if (Array.isArray(dest) && dest[0]) {
+                const pageIndex = await pdfDoc.getPageIndex(dest[0])
+                goToPage(pageIndex + 1)
+            }
+        } catch (e) {
+            console.error('TOC navigation error:', e)
+        }
+    }, [pdfDoc, goToPage])
+
+    useEffect(() => {
+        if (!loading && pdfDoc && initialPage && initialPage >= 1 && initialPage <= totalPages) {
+            goToPage(initialPage)
+        }
+    }, [loading, pdfDoc, initialPage, totalPages, goToPage])
+
     useEffect(() => {
         const container = scrollContainerRef.current
         if (!container || !totalPages) return
@@ -299,6 +403,7 @@ function PdfReader({ bookId }: { bookId: number }) {
             for (let i = wrappers.length - 1; i >= 0; i--) {
                 const el = wrappers[i] as HTMLElement
                 if (el.offsetTop <= containerTop) {
+                    currentPageRef.current = i + 1
                     setCurrentPage(i + 1)
                     break
                 }
@@ -317,8 +422,8 @@ function PdfReader({ bookId }: { bookId: number }) {
             else if (e.key === 'ArrowUp') { container.scrollBy({ top: -scrollAmount, behavior: 'smooth' }); e.preventDefault() }
             else if (e.key === 'PageDown' || e.key === ' ') { container.scrollBy({ top: container.clientHeight * 0.9, behavior: 'smooth' }); e.preventDefault() }
             else if (e.key === 'PageUp') { container.scrollBy({ top: -container.clientHeight * 0.9, behavior: 'smooth' }); e.preventDefault() }
-            else if (e.key === 'ArrowRight') { goToPage(Math.min(totalPages, currentPage + 1)); e.preventDefault() }
-            else if (e.key === 'ArrowLeft') { goToPage(Math.max(1, currentPage - 1)); e.preventDefault() }
+            else if (e.key === 'ArrowRight') { goToPage(Math.min(totalPages, currentPageRef.current + 1)); e.preventDefault() }
+            else if (e.key === 'ArrowLeft') { goToPage(Math.max(1, currentPageRef.current - 1)); e.preventDefault() }
             else if (e.key === '+' || e.key === '=') setScale(s => Math.min(3, s + 0.25))
             else if (e.key === '-') setScale(s => Math.max(0.5, s - 0.25))
             else if (e.key === 'Home') { container.scrollTo({ top: 0, behavior: 'smooth' }); e.preventDefault() }
@@ -326,16 +431,20 @@ function PdfReader({ bookId }: { bookId: number }) {
         }
         window.addEventListener('keydown', handleKey)
         return () => window.removeEventListener('keydown', handleKey)
-    }, [totalPages, currentPage])
+    }, [totalPages, goToPage])
 
-    const goToPage = useCallback((pageNum: number) => {
+    useEffect(() => {
         const container = scrollContainerRef.current
         if (!container) return
-        const wrapper = container.querySelector(`[data-page="${pageNum}"]`) as HTMLElement
-        if (wrapper) {
-            wrapper.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        const handleWheel = (e: WheelEvent) => {
+            if (!e.ctrlKey) return
+            e.preventDefault()
+            const delta = e.deltaY < 0 ? 0.1 : -0.1
+            setScale(s => Math.round(Math.min(3, Math.max(0.5, s + delta)) * 10) / 10)
         }
-    }, [])
+        container.addEventListener('wheel', handleWheel, { passive: false })
+        return () => container.removeEventListener('wheel', handleWheel)
+    }, [loading])
 
     const [contextMenu, setContextMenu] = useState<{ x: number, y: number, text: string, page: number, rects: any[] } | null>(null)
     const [annotations, setAnnotations] = useState<Annotation[]>([])
@@ -360,8 +469,9 @@ function PdfReader({ bookId }: { bookId: number }) {
             if (!wrapper) return
             
             const pageNum = Number(wrapper.getAttribute('data-page'))
+            if (!pageNum || isNaN(pageNum)) return
             const wrapperRect = wrapper.getBoundingClientRect()
-            
+
             const text = selection.toString().trim()
             if (!text) return
             
@@ -425,6 +535,15 @@ function PdfReader({ bookId }: { bookId: number }) {
     return (
         <div className="pdf-reader" onMouseUp={handleMouseUp}>
             <div className="reader-controls">
+                {outline.length > 0 && (
+                    <button
+                        className={`btn-icon${showToc ? ' active' : ''}`}
+                        onClick={() => setShowToc(v => !v)}
+                        title="Table of Contents"
+                    >
+                        <FiList />
+                    </button>
+                )}
                 <button className="btn-icon" onClick={() => goToPage(Math.max(1, currentPage - 1))} disabled={currentPage <= 1}>
                     <FiChevronLeft />
                 </button>
@@ -448,19 +567,27 @@ function PdfReader({ bookId }: { bookId: number }) {
                     <button className="btn-icon" onClick={() => setScale(1.5)} title="Reset zoom"><FiMaximize /></button>
                 </div>
             </div>
-            <div className="canvas-container" ref={scrollContainerRef} tabIndex={0} style={{ overflowY: 'auto', height: '100%' }}>
-                {pages.map(pageNum => (
-                    <PdfPageCanvas 
-                        key={pageNum} 
-                        pdfDoc={pdfDoc} 
-                        pageNum={pageNum} 
-                        scale={scale} 
-                        annotations={annotations.filter(a => {
-                            try { return JSON.parse(a.location).page === pageNum } catch { return false }
-                        })}
-                        onEditNote={setEditingNote}
-                    />
-                ))}
+            <div className="reader-body">
+                {showToc && outline.length > 0 && (
+                    <div className="toc-sidebar">
+                        <div className="toc-sidebar-title">Table of Contents</div>
+                        <TocSidebar items={outline} onNavigate={navigateOutline} />
+                    </div>
+                )}
+                <div className="canvas-container" ref={scrollContainerRef} tabIndex={0}>
+                    {pages.map(pageNum => (
+                        <PdfPageCanvas
+                            key={pageNum}
+                            pdfDoc={pdfDoc}
+                            pageNum={pageNum}
+                            scale={scale}
+                            annotations={annotations.filter(a => {
+                                try { return JSON.parse(a.location).page === pageNum } catch { return false }
+                            })}
+                            onEditNote={setEditingNote}
+                        />
+                    ))}
+                </div>
             </div>
 
             {contextMenu && (
@@ -494,20 +621,22 @@ function PdfReader({ bookId }: { bookId: number }) {
 
 // ─── EPUB Reader ────────────────────────────────────────────────
 
-function EpubReader({ bookId }: { bookId: number }) {
+function EpubReader({ bookId, initialLocation }: { bookId: number; initialLocation?: string }) {
     const containerRef = useRef<HTMLDivElement>(null)
     const renditionRef = useRef<any>(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [tocItems, setTocItems] = useState<Array<{ label: string; href: string }>>([])
     const [showToc, setShowToc] = useState(false)
-    
+
     const [contextMenu, setContextMenu] = useState<{ x: number, y: number, text: string, cfiRange: string } | null>(null)
     const [annotations, setAnnotations] = useState<Annotation[]>([])
+    const annotationsRef = useRef<Annotation[]>([])
     const [editingNote, setEditingNote] = useState<Annotation | null>(null)
 
     useEffect(() => {
         let book: any = null
+        let mounted = true
         const init = async () => {
             try {
                 if (!(window as any).ePub) {
@@ -520,17 +649,21 @@ function EpubReader({ bookId }: { bookId: number }) {
                     })
                 }
 
+                if (!mounted) return
+
                 const ePub = (window as any).ePub
                 const url = api.getFileUrl(bookId)
                 book = ePub(url)
                 await book.ready
 
+                if (!mounted) return
+
                 const nav = await book.loaded.navigation
-                if (nav?.toc) {
+                if (nav?.toc && mounted) {
                     setTocItems(nav.toc.map((t: any) => ({ label: t.label.trim(), href: t.href })))
                 }
 
-                if (containerRef.current) {
+                if (containerRef.current && mounted) {
                     const rendition = book.renderTo(containerRef.current, {
                         width: '100%',
                         height: '100%',
@@ -555,14 +688,18 @@ function EpubReader({ bookId }: { bookId: number }) {
                     })
 
                     api.getAnnotations(bookId).then(anns => {
+                        if (!mounted) return
+                        annotationsRef.current = anns
                         setAnnotations(anns)
                         anns.forEach(ann => {
                             try {
                                 const loc = JSON.parse(ann.location)
                                 if (loc.cfi) {
                                     const c = COLORS.find(c => c.name === ann.color) || COLORS[0]
-                                    rendition.annotations.highlight(loc.cfi, {}, (e: any) => {
-                                        setEditingNote(ann)
+                                    rendition.annotations.highlight(loc.cfi, {}, () => {
+                                        // Look up the latest version of the annotation from the ref
+                                        const latest = annotationsRef.current.find(a => a.id === ann.id)
+                                        if (latest && mounted) setEditingNote(latest)
                                     }, '', { fill: c.hex, 'fill-opacity': '1' })
                                 }
                             } catch {}
@@ -570,6 +707,7 @@ function EpubReader({ bookId }: { bookId: number }) {
                     }).catch(console.warn)
 
                     rendition.on('selected', (cfiRange: string, contents: any) => {
+                        if (!mounted) return
                         const range = rendition.getRange(cfiRange)
                         if (!range) return
                         const rect = range.getBoundingClientRect()
@@ -588,20 +726,38 @@ function EpubReader({ bookId }: { bookId: number }) {
                         }
                     })
 
-                    rendition.on('click', () => setContextMenu(null))
-                    rendition.on('relocated', () => setContextMenu(null))
-                    await rendition.display()
-                    setLoading(false)
+                    rendition.on('click', () => { if (mounted) setContextMenu(null) })
+                    rendition.on('relocated', () => { if (mounted) setContextMenu(null) })
+
+                    // Initial jump attempt
+                    if (initialLocation) {
+                        rendition.display(initialLocation).catch(console.warn)
+                    } else {
+                        rendition.display()
+                    }
+
+                    // Fallback: If initialLocation was missed, retry once after first render
+                    rendition.once('rendered', () => {
+                        if (!mounted) return
+                        if (initialLocation) {
+                            rendition.display(initialLocation).catch(() => {})
+                        }
+                    })
+
+                    if (mounted) setLoading(false)
                 }
             } catch (e: any) {
                 console.error("EPUB loading error:", e)
-                setError(e.message || 'Failed to load EPUB')
-                setLoading(false)
+                if (mounted) {
+                    setError(e.message || 'Failed to load EPUB')
+                    setLoading(false)
+                }
             }
         }
         init()
 
         return () => {
+            mounted = false
             if (renditionRef.current) try { renditionRef.current.destroy() } catch { }
             if (book) try { book.destroy() } catch { }
         }
@@ -623,32 +779,40 @@ function EpubReader({ bookId }: { bookId: number }) {
     return (
         <div className="epub-reader">
             <div className="reader-controls">
+                {tocItems.length > 0 && (
+                    <button
+                        className={`btn-icon${showToc ? ' active' : ''}`}
+                        onClick={() => setShowToc(v => !v)}
+                        title="Table of Contents"
+                    >
+                        <FiList />
+                    </button>
+                )}
                 <button className="btn-icon" onClick={() => renditionRef.current?.prev()} title="Previous">
                     <FiChevronLeft />
-                </button>
-                <button
-                    className="btn-secondary"
-                    onClick={() => setShowToc(!showToc)}
-                    style={{ fontSize: '12px', padding: '4px 12px' }}
-                >
-                    Table of Contents
                 </button>
                 <button className="btn-icon" onClick={() => renditionRef.current?.next()} title="Next">
                     <FiChevronRight />
                 </button>
             </div>
 
-            {showToc && tocItems.length > 0 && (
-                <div className="epub-toc">
-                    {tocItems.map((item, i) => (
-                        <div key={i} className="toc-item" onClick={() => { renditionRef.current?.display(item.href); setShowToc(false) }}>
-                            {item.label}
-                        </div>
-                    ))}
-                </div>
-            )}
-
-            <div ref={containerRef} className="epub-viewer" style={{ opacity: loading ? 0 : 1 }} />
+            <div className="reader-body">
+                {showToc && tocItems.length > 0 && (
+                    <div className="toc-sidebar">
+                        <div className="toc-sidebar-title">Table of Contents</div>
+                        {tocItems.map((item, i) => (
+                            <div
+                                key={i}
+                                className="toc-item"
+                                onClick={() => renditionRef.current?.display(item.href)}
+                            >
+                                {item.label}
+                            </div>
+                        ))}
+                    </div>
+                )}
+                <div ref={containerRef} className="epub-viewer" style={{ opacity: loading ? 0 : 1 }} />
+            </div>
 
             {contextMenu && (
                 <ContextMenu 
@@ -670,13 +834,15 @@ function EpubReader({ bookId }: { bookId: number }) {
                                 selected_text: contextMenu.text,
                                 color,
                             })
-                            setAnnotations(prev => [...prev, ann])
+                            annotationsRef.current = [...annotationsRef.current, ann]
+                            setAnnotations(annotationsRef.current)
                             setContextMenu(null)
                             renditionRef.current?.getContents()?.forEach((c: any) => c.window.getSelection()?.removeAllRanges())
 
                             const cData = COLORS.find(c => c.name === color) || COLORS[0]
-                            renditionRef.current?.annotations.highlight(contextMenu.cfiRange, {}, (e: any) => {
-                                setEditingNote(ann)
+                            renditionRef.current?.annotations.highlight(contextMenu.cfiRange, {}, () => {
+                                const latest = annotationsRef.current.find(a => a.id === ann.id)
+                                if (latest) setEditingNote(latest)
                             }, '', { fill: cData.hex, 'fill-opacity': '1' })
                         } catch(e) { console.error("Failed to save highlight", e) }
                     }}
@@ -695,12 +861,14 @@ function EpubReader({ bookId }: { bookId: number }) {
                                 renditionRef.current?.annotations.remove(loc.cfi, 'highlight')
                             }
                         } catch {}
-                        setAnnotations(prev => prev.filter(a => a.id !== editingNote.id))
+                        annotationsRef.current = annotationsRef.current.filter(a => a.id !== editingNote.id)
+                        setAnnotations(annotationsRef.current)
                         setEditingNote(null)
                     }}
                     onSave={async (note) => {
                         const updated = await api.updateAnnotation(editingNote.id, { note })
-                        setAnnotations(prev => prev.map(a => a.id === updated.id ? updated : a))
+                        annotationsRef.current = annotationsRef.current.map(a => a.id === updated.id ? updated : a)
+                        setAnnotations(annotationsRef.current)
                         setEditingNote(null)
                     }}
                 />
@@ -715,6 +883,8 @@ export default function ReaderPage() {
     const [params] = useSearchParams()
     const navigate = useNavigate()
     const bookId = Number(params.get('id'))
+    const initialPage = params.get('page') ? Number(params.get('page')) : undefined
+    const initialLocation = params.get('location') || undefined
     const [book, setBook] = useState<Book | null>(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
@@ -758,9 +928,9 @@ export default function ReaderPage() {
             </div>
             <div className="reader-content">
                 {book.format === 'pdf' ? (
-                    <PdfReader bookId={bookId} />
+                    <PdfReader bookId={bookId} initialPage={initialPage} />
                 ) : book.format === 'epub' ? (
-                    <EpubReader bookId={bookId} />
+                    <EpubReader bookId={bookId} initialLocation={initialLocation} />
                 ) : ['txt', 'html', 'htm', 'mobi', 'azw3'].includes(book.format) ? (
                     <TextReader book={book} />
                 ) : (

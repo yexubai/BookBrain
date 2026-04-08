@@ -1,3 +1,18 @@
+/**
+ * SettingsPage — Application configuration page.
+ *
+ * Sections:
+ *   1. Backend Connection: configure and test the backend URL
+ *      (useful for switching between local and remote NAS servers)
+ *   2. Ebook Directories: set paths to scan for ebooks
+ *   3. OCR Settings: enable/disable OCR and configure languages
+ *   4. Performance: adjust worker thread count
+ *   5. System Info: read-only display of embedding model and data directory
+ *
+ * Settings are persisted server-side via PUT /api/settings and saved
+ * to data/user_settings.json on the backend.
+ */
+
 import { useState, useEffect } from 'react'
 import { api, Settings, getBackendUrl, setBackendUrl, checkBackendHealth, isTauri } from '../api'
 import { FiCheck, FiX, FiRefreshCw, FiFolder } from 'react-icons/fi'

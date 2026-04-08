@@ -1,4 +1,18 @@
-"""Metadata and text extraction from ebook files."""
+"""Metadata and text extraction from ebook files.
+
+Provides format-specific extractors for:
+  - PDF  (via PyMuPDF/fitz)
+  - EPUB (via ebooklib)
+  - TXT  (with encoding auto-detection: UTF-8 → GBK → Latin-1)
+  - HTML (via BeautifulSoup)
+  - MOBI/AZW3 (basic raw-text fallback)
+  - CBZ  (comic book zip — images only, no text extraction)
+
+Each extractor returns a ``BookMetadata`` dataclass containing the title,
+author, text content, page-level chunks, cover image, and other metadata.
+The main dispatch function ``extract_metadata()`` selects the right extractor
+based on file extension.
+"""
 
 import hashlib
 import logging
@@ -11,7 +25,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BookMetadata:
-    """Extracted book metadata."""
+    """Container for extracted ebook metadata and content.
+
+    Attributes:
+        title: Book title (falls back to filename stem if not found).
+        author: Author name (defaults to "Unknown").
+        chunks: List of text segments, each a dict with keys:
+                ``content`` (str), ``page_number`` (int|None), ``location_tag`` (str|None).
+                Used for page-level search indexing and vector embedding.
+        text_content: Full concatenated text (truncated to max_text_length).
+        cover_image: Raw bytes of the cover image (JPEG or PNG).
+        cover_ext: File extension for the cover image (".jpg" or ".png").
+    """
     title: str = ""
     author: str = "Unknown"
     isbn: Optional[str] = None
@@ -21,6 +46,7 @@ class BookMetadata:
     description: Optional[str] = None
     page_count: Optional[int] = None
     text_content: str = ""
+    chunks: list[dict] = field(default_factory=list)
     cover_image: Optional[bytes] = None
     cover_ext: str = ".jpg"
 
@@ -35,7 +61,12 @@ def compute_file_hash(file_path: Path) -> str:
 
 
 def extract_pdf(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
-    """Extract metadata and text from a PDF file using PyMuPDF."""
+    """Extract metadata, text, and cover from a PDF file using PyMuPDF (fitz).
+
+    Text is chunked by page — each page becomes one entry in ``metadata.chunks``
+    with its 1-based page number.  The cover is rendered from the first page
+    at 2x zoom and saved as JPEG.
+    """
     import fitz  # PyMuPDF
 
     metadata = BookMetadata()
@@ -65,11 +96,17 @@ def extract_pdf(file_path: Path, max_text_length: int = 2000000) -> BookMetadata
             except (ValueError, IndexError):
                 pass
 
-        # Text extraction
+        # Text extraction (chunked by page)
         text_parts = []
         total_chars = 0
-        for page in doc:
+        for i, page in enumerate(doc):
             page_text = page.get_text()
+            if page_text.strip():
+                metadata.chunks.append({
+                    "content": page_text,
+                    "page_number": i + 1,
+                    "location_tag": f"page_{i+1}"
+                })
             text_parts.append(page_text)
             total_chars += len(page_text)
             if total_chars >= max_text_length:
@@ -97,7 +134,13 @@ def extract_pdf(file_path: Path, max_text_length: int = 2000000) -> BookMetadata
 
 
 def extract_epub(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
-    """Extract metadata and text from an EPUB file."""
+    """Extract metadata, text, and cover from an EPUB file using ebooklib.
+
+    Text is chunked by EPUB document item (roughly one chapter per chunk).
+    HTML tags are stripped using a simple parser.  The cover image is found
+    by searching for an image item with "cover" in its name, falling back
+    to the first image in the archive.
+    """
     import ebooklib
     from ebooklib import epub
     from html.parser import HTMLParser
@@ -170,15 +213,20 @@ def extract_epub(file_path: Path, max_text_length: int = 2000000) -> BookMetadat
             except (ValueError, IndexError):
                 pass
 
-        # Text extraction
+        # Text extraction (chunked by chapter/item)
         text_parts = []
         total_chars = 0
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        for i, item in enumerate(book.get_items_of_type(ebooklib.ITEM_DOCUMENT)):
             content = item.get_content()
             stripper = HTMLStripper()
             stripper.feed(content.decode("utf-8", errors="ignore"))
             text = stripper.get_text().strip()
             if text:
+                metadata.chunks.append({
+                    "content": text,
+                    "page_number": i + 1,
+                    "location_tag": item.get_name()
+                })
                 text_parts.append(text)
                 total_chars += len(text)
                 if total_chars >= max_text_length:
@@ -220,7 +268,12 @@ def extract_epub(file_path: Path, max_text_length: int = 2000000) -> BookMetadat
 
 
 def extract_txt(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
-    """Extract metadata and text from a TXT file."""
+    """Extract text from a plain text file with encoding auto-detection.
+
+    Tries UTF-8 first, then GBK (common for Chinese text), then Latin-1
+    as a last resort.  Uses simple heuristics on the first few lines to
+    guess the title and author.
+    """
     metadata = BookMetadata(title=file_path.stem)
     try:
         # Try to read with UTF-8, fallback to other encodings
@@ -273,8 +326,11 @@ def extract_html(file_path: Path, max_text_length: int = 2000000) -> BookMetadat
 
 
 def extract_mobi_azw3(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
-    """Basic extraction for Kindle formats (MOBI/AZW3).
-    Requires 'mobi' package for full extraction, doing basic fallback for now.
+    """Basic text extraction for Kindle formats (MOBI/AZW3).
+
+    Uses a crude approach: reads raw bytes, filters for printable ASCII
+    characters, and strips XML/HTML tags.  This is a fallback implementation;
+    for better results, consider using Calibre's ``ebook-convert`` CLI.
     """
     metadata = BookMetadata(title=file_path.stem)
     try:
@@ -303,7 +359,12 @@ def extract_mobi_azw3(file_path: Path, max_text_length: int = 2000000) -> BookMe
 
 
 def extract_cbz(file_path: Path) -> BookMetadata:
-    """Extract metadata from CBZ (Comic Book Zip). Text extraction skipped as it's images."""
+    """Extract metadata from a CBZ (Comic Book Zip) archive.
+
+    CBZ files contain only images (no text), so only page count and cover
+    image are extracted.  The first image (alphabetically sorted) is used
+    as the cover.
+    """
     import zipfile
     metadata = BookMetadata(title=file_path.stem)
     try:
@@ -326,9 +387,11 @@ def extract_cbz(file_path: Path) -> BookMetadata:
 
 
 def extract_metadata(file_path: Path, max_text_length: int = 2000000) -> BookMetadata:
-    """Extract metadata and text from an ebook file.
+    """Dispatch to the appropriate format-specific extractor based on file extension.
 
-    Dispatches to format-specific extractors.
+    This is the main entry point for extraction.  Returns a BookMetadata
+    dataclass regardless of format; unsupported formats return a minimal
+    result with only the filename as the title.
     """
     ext = file_path.suffix.lower()
 
