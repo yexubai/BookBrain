@@ -1,10 +1,15 @@
 # ==============================================================
-# BookBrain Docker Compose — One-click NAS deployment
+# BookBrain Docker Compose — One-click NAS / Linux deployment
 #
 # Quick start:
-#   1. Adjust the ebook volume path below to your NAS ebook directory
+#   1. Adjust the ebook volume path below to match your system:
+#        Synology NAS : /volume1/ebooks
+#        QNAP NAS     : /share/ebooks
+#        TrueNAS      : /mnt/pool/ebooks
+#        Linux / macOS: /home/user/ebooks  (or any local path)
+#        Windows      : C:\Users\user\ebooks
 #   2. Run: docker-compose up -d
-#   3. Open http://<nas-ip>:8000 in your browser
+#   3. Open http://<host-ip>:8000 in your browser
 #
 # Data persistence:
 #   - bookbrain_data volume stores the SQLite database, extracted
@@ -24,24 +29,32 @@ services:
     ports:
       - "8000:8000"                  # Expose the API and web UI
     volumes:
-      # Mount your ebook directory (adjust the left side for your NAS path)
+      # Mount your ebook directory — adjust the host path (left side) for your platform:
+      #   Synology NAS : /volume1/ebooks:/ebooks:ro
+      #   QNAP NAS     : /share/ebooks:/ebooks:ro
+      #   TrueNAS      : /mnt/pool/ebooks:/ebooks:ro
+      #   Linux / macOS: /home/user/ebooks:/ebooks:ro
       - /volume1/ebooks:/ebooks:ro
       # Named volume for persistent data (DB, covers, FAISS index)
       - bookbrain_data:/data
     environment:
       - BOOKBRAIN_EBOOK_DIRS=/ebooks           # Directories to scan (inside container)
       - BOOKBRAIN_OCR_ENABLED=true             # Enable OCR for scanned PDFs
-      - BOOKBRAIN_OCR_LANGUAGE=eng+chi_sim     # OCR languages (EasyOCR format)
+      # EasyOCR language codes — use '+' as separator (NOT Tesseract format)
+      # Common codes: ch_sim (Simplified Chinese), en (English), ja (Japanese), ko (Korean)
+      - BOOKBRAIN_OCR_LANGUAGE=ch_sim+en
       - BOOKBRAIN_MAX_WORKERS=4                # Parallel processing threads
       - BOOKBRAIN_DEBUG=false                  # Set to true for verbose logging
     restart: unless-stopped                    # Auto-restart on crash or NAS reboot
     healthcheck:
-      # Simple health check: hit the root endpoint
+      # Simple health check: hit the root endpoint.
+      # start_period gives the app time to load ML models on first start;
+      # increase to 120s on low-memory NAS devices (< 2 GB RAM).
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 30s  # Give the app time to load ML models on first start
+      retries: 5
+      start_period: 60s
 
 volumes:
   bookbrain_data:

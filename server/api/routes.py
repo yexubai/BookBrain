@@ -584,8 +584,18 @@ async def rebuild_fts_index(
                 id,
                 COALESCE(title, ''),
                 COALESCE(author, ''),
-                COALESCE(REPLACE(file_path,
-                    RTRIM(file_path, REPLACE(file_path, '/', '')), ''), ''),
+                COALESCE(
+                    CASE
+                        WHEN INSTR(file_path, '/') >= INSTR(file_path, CHAR(92))
+                            AND INSTR(file_path, '/') > 0
+                        THEN REPLACE(file_path,
+                                RTRIM(file_path, REPLACE(file_path, '/', '')), '')
+                        WHEN INSTR(file_path, CHAR(92)) > 0
+                        THEN REPLACE(file_path,
+                                RTRIM(file_path, REPLACE(file_path, CHAR(92), '')), '')
+                        ELSE file_path
+                    END,
+                ''),
                 COALESCE(summary, ''),
                 COALESCE(description, ''),
                 COALESCE(text_content, '')

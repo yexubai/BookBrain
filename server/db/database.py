@@ -91,8 +91,18 @@ async def init_db() -> None:
                     new.id,
                     COALESCE(new.title, ''),
                     COALESCE(new.author, ''),
-                    COALESCE(REPLACE(new.file_path,
-                        RTRIM(new.file_path, REPLACE(new.file_path, '/', '')), ''), ''),
+                    COALESCE(
+                        CASE
+                            WHEN INSTR(new.file_path, '/') >= INSTR(new.file_path, CHAR(92))
+                                AND INSTR(new.file_path, '/') > 0
+                            THEN REPLACE(new.file_path,
+                                    RTRIM(new.file_path, REPLACE(new.file_path, '/', '')), '')
+                            WHEN INSTR(new.file_path, CHAR(92)) > 0
+                            THEN REPLACE(new.file_path,
+                                    RTRIM(new.file_path, REPLACE(new.file_path, CHAR(92), '')), '')
+                            ELSE new.file_path
+                        END,
+                    ''),
                     COALESCE(new.summary, ''),
                     COALESCE(new.description, ''),
                     COALESCE(new.text_content, '')
@@ -116,8 +126,18 @@ async def init_db() -> None:
                     new.id,
                     COALESCE(new.title, ''),
                     COALESCE(new.author, ''),
-                    COALESCE(REPLACE(new.file_path,
-                        RTRIM(new.file_path, REPLACE(new.file_path, '/', '')), ''), ''),
+                    COALESCE(
+                        CASE
+                            WHEN INSTR(new.file_path, '/') >= INSTR(new.file_path, CHAR(92))
+                                AND INSTR(new.file_path, '/') > 0
+                            THEN REPLACE(new.file_path,
+                                    RTRIM(new.file_path, REPLACE(new.file_path, '/', '')), '')
+                            WHEN INSTR(new.file_path, CHAR(92)) > 0
+                            THEN REPLACE(new.file_path,
+                                    RTRIM(new.file_path, REPLACE(new.file_path, CHAR(92), '')), '')
+                            ELSE new.file_path
+                        END,
+                    ''),
                     COALESCE(new.summary, ''),
                     COALESCE(new.description, ''),
                     COALESCE(new.text_content, '')

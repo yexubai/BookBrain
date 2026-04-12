@@ -13,8 +13,12 @@ build/
 
 # Virtual environment
 venv/
+.venv/
 env/
 .env
+
+# Claude Code
+.claude/
 
 # Data
 data/

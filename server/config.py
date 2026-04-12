@@ -82,9 +82,28 @@ class Settings(BaseSettings):
 
     @property
     def ebook_directories(self) -> List[Path]:
-        """Parse the comma-separated ``ebook_dirs`` string into a list of Paths."""
+        """Parse ``ebook_dirs`` into a list of Paths.
+
+        Supports two formats (auto-detected):
+        - JSON array:          '["C:\\\\Books", "/volume1/ebooks"]'
+          → preferred; handles paths that contain commas
+        - Comma-separated:     '/home/user/books, /mnt/nas/ebooks'
+          → legacy; kept for backward compatibility
+
+        On Windows the paths are returned as-is (backslash preserved).
+        On Unix/NAS they are returned as-is (forward slash preserved).
+        """
         if not self.ebook_dirs:
             return []
+        # Try JSON array first so paths containing commas are handled correctly.
+        import json
+        try:
+            parsed = json.loads(self.ebook_dirs)
+            if isinstance(parsed, list):
+                return [Path(d) for d in parsed if isinstance(d, str) and d.strip()]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Fall back to comma-separated (original behaviour).
         return [Path(d.strip()) for d in self.ebook_dirs.split(",") if d.strip()]
 
     # ── Persistence helpers ────────────────────────────────────
@@ -130,10 +149,26 @@ class Settings(BaseSettings):
             print(f"Warning: Could not load user settings: {e}")
 
     def ensure_directories(self) -> None:
-        """Create required data directories if they don't exist."""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.covers_dir.mkdir(parents=True, exist_ok=True)
-        self.index_dir.mkdir(parents=True, exist_ok=True)
+        """Create required data directories if they don't exist.
+
+        Raises a ``PermissionError`` with a human-readable message when the
+        process lacks write access (common on NAS/read-only mounts and inside
+        packaged Tauri apps where the resource dir is not writable).
+        """
+        for directory in (self.data_dir, self.covers_dir, self.index_dir):
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except PermissionError as exc:
+                raise PermissionError(
+                    f"Cannot create data directory '{directory}': {exc}.\n"
+                    "Set the BOOKBRAIN_DATA_DIR environment variable to a writable path "
+                    "(e.g. export BOOKBRAIN_DATA_DIR=/volume1/homes/@bookbrain/data on Synology NAS)."
+                ) from exc
+            except OSError as exc:
+                raise OSError(
+                    f"Failed to create directory '{directory}': {exc}.\n"
+                    "Check that the path is valid and the filesystem is mounted."
+                ) from exc
 
 
 # Singleton settings instance used throughout the application
